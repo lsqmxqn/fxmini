@@ -1,0 +1,15 @@
+# Text is stored with LF in the repository and checked out using the platform
+# default, which is what core.autocrlf=true already does here — this just makes
+# the intent explicit so a clone on any machine gets the same result.
+* text=auto
+
+# Never rewrite line endings in, or attempt a text diff on, these.
+*.png    binary
+*.ico    binary
+*.fac    binary
+*.sys    binary
+*.cat    binary
+*.dll    binary
+*.exe    binary
+*.pdb    binary
+*.rlib   binary

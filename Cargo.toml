@@ -1,0 +1,48 @@
+[package]
+name = "fxmini"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Tray-resident FxSound-compatible audio enhancer, without the FxSound app"
+repository = "https://github.com/lsqmxqn/fxmini"
+readme = "README.md"
+build = "build.rs"
+
+[build-dependencies]
+cc = "1"
+
+[dependencies]
+# The panel is the only window FxMini ever opens, and it is destroyed when
+# closed. `glow` (OpenGL) is chosen over the default `wgpu` backend because it
+# pulls in a fraction of the dependency tree and starts faster for a UI this
+# small; the whole point of FxMini is not being NexBox.
+eframe = { version = "0.35.0", default-features = false, features = [
+    "default_fonts",
+    "glow",
+] }
+log = "0.4.34"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+simplelog = "0.12.2"
+# Direct only for `EventLoopBuilderExtWindows::with_any_thread`. winit refuses to
+# build an event loop off the main thread, and opening the panel on a worker
+# thread is the whole memory strategy (the GL context and font atlas die with
+# the thread when the window closes). The version and feature set deliberately
+# mirror eframe's own winit dependency so cargo resolves a single crate
+# instance; if they ever diverge the build fails loudly instead of silently
+# linking two copies of winit.
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+# Windows needs no feature flag; the crate's features are all Linux/macOS
+# backends, and enabling them drags GTK into the lock file for nothing.
+tray-icon = { version = "0.25.0", default-features = false }
+windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_Media_KernelStreaming", "Win32_Media_Multimedia", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Devices_DeviceAndDriverInstallation", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_UI_Shell_PropertiesSystem"] }
+windows-core = { version = "0.62", features = ["std"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+# NOT "abort": the audio thread catches panics so it can report a fault and
+# rebuild instead of taking the whole process down (see engine::run_audio_thread).
+panic = "unwind"

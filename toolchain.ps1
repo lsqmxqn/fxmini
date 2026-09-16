@@ -1,0 +1,147 @@
+# FxMini — set up the MSVC + Windows SDK build environment.
+#
+#   . .\toolchain.ps1                       # auto-detect
+#   cargo build --release --bin dspcheck
+#
+# Or with an explicit layout:
+#   . .\toolchain.ps1 -MsvcRoot 'D:\Program Files\VisualStudio\VC\Tools\MSVC'
+#
+# ---------------------------------------------------------------------------
+# Why this script exists
+#
+# On this machine Visual Studio lives at D:\Program Files\VisualStudio and is
+# NOT registered with the installer, so `vswhere.exe` returns nothing and there
+# is no HKLM\...\VisualStudio\SxS\VS7 entry. Consequences:
+#
+#   * cargo cannot find link.exe, so even a hello-world Rust program fails to
+#     build ("linker `link.exe` not found");
+#   * the `cc` crate cannot find cl.exe, so the vendored DSP never compiles.
+#
+# There is also a second, sneakier trap: Git for Windows ships a coreutils
+# `link.exe` in /usr/bin that is a hardlink utility, not a linker. If it comes
+# first on PATH, rustc invokes it and the build dies with
+# "link: extra operand ... Try 'link --help'". Prepending the MSVC bin
+# directory — which this script does — resolves both problems.
+# ---------------------------------------------------------------------------
+
+param(
+    [string]$MsvcRoot = 'D:\Program Files\VisualStudio\VC\Tools\MSVC',
+    [string]$SdkRoot  = 'C:\Program Files (x86)\Windows Kits\10',
+    [string]$Arch     = 'x64',
+    [string]$HostArch = 'Hostx64'
+)
+
+# Dot-sourcing a script runs it in the caller's scope, so any assignment to
+# $ErrorActionPreference leaks into the session. That matters: with 'Stop',
+# PowerShell 5.1 turns redirected *native* stderr into a terminating
+# NativeCommandError — so the next `cargo build` would die on cargo's own
+# progress output ("Compiling ..."). Save the caller's value first, restore it
+# at the end of this script.
+$fxmini_previous_eap = $ErrorActionPreference
+$ErrorActionPreference = 'Stop'
+
+function Get-NewestVersionDir {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        # Empty is valid and means "the version directory itself is the probe"
+        # (used for the Windows SDK, whose version dirs are always usable). A
+        # Mandatory string parameter rejects '' unless AllowEmptyString is set.
+        [Parameter(Mandatory)][AllowEmptyString()][string]$RelativeProbe,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    if (-not (Test-Path $Root)) {
+        throw "$Label root not found: $Root"
+    }
+
+    # Only consider versions that actually ship the piece we need. A partially
+    # installed toolset (e.g. MSVC 14.50 here has headers but no lib\x64) would
+    # otherwise be picked as "newest" and fail much later, during linking.
+    $candidates = Get-ChildItem -Path $Root -Directory |
+        Where-Object {
+            if ([string]::IsNullOrEmpty($RelativeProbe)) { $true }
+            else { Test-Path (Join-Path $_.FullName $RelativeProbe) }
+        } |
+        Sort-Object { [version]($_.Name -replace '[^0-9.]', '') } -Descending
+
+    if (-not $candidates) {
+        throw "$Label has no usable version under $Root (none contains '$RelativeProbe')"
+    }
+
+    return $candidates[0].FullName
+}
+
+$toolset = Get-NewestVersionDir -Root $MsvcRoot `
+    -RelativeProbe "lib\$Arch" -Label 'MSVC toolset'
+
+$sdkVersion = Get-NewestVersionDir -Root (Join-Path $SdkRoot 'Include') `
+    -RelativeProbe '' -Label 'Windows SDK include'
+$sdkVersionName = Split-Path $sdkVersion -Leaf
+
+if (-not (Test-Path (Join-Path $SdkRoot "Lib\$sdkVersionName\um\$Arch"))) {
+    throw "Windows SDK $sdkVersionName has no Lib\...\um\$Arch — install the SDK's x64 libraries"
+}
+
+$vcBin = Join-Path $toolset "bin\$HostArch\$Arch"
+if (-not (Test-Path (Join-Path $vcBin 'cl.exe'))) {
+    throw "cl.exe not found in $vcBin"
+}
+
+$sdkBin = Join-Path $SdkRoot "bin\$sdkVersionName\$Arch"
+
+# MSVC's bin directory MUST come first: see the Git-for-Windows link.exe note
+# at the top of this file.
+$env:PATH = (@($vcBin, $sdkBin) + ($env:PATH -split ';')) -join ';'
+
+$env:INCLUDE = (@(
+        (Join-Path $toolset 'include')
+        (Join-Path $SdkRoot "Include\$sdkVersionName\ucrt")
+        (Join-Path $SdkRoot "Include\$sdkVersionName\um")
+        (Join-Path $SdkRoot "Include\$sdkVersionName\shared")
+        (Join-Path $SdkRoot "Include\$sdkVersionName\winrt")
+        (Join-Path $SdkRoot "Include\$sdkVersionName\cppwinrt")
+    ) -join ';')
+
+$env:LIB = (@(
+        (Join-Path $toolset "lib\$Arch")
+        (Join-Path $SdkRoot "Lib\$sdkVersionName\ucrt\$Arch")
+        (Join-Path $SdkRoot "Lib\$sdkVersionName\um\$Arch")
+    ) -join ';')
+
+# Tell cc-rs which compiler to use instead of letting it probe vswhere, which
+# cannot see this installation.
+$env:CC = 'cl.exe'
+$env:CXX = 'cl.exe'
+
+# cl.exe prints its banner on stderr and exits non-zero when given no inputs.
+# Under $ErrorActionPreference='Stop' PowerShell 5.1 turns redirected native
+# stderr into a terminating NativeCommandError, which would abort this script
+# on a probe that is expected to "fail". Relax the preference for the probe.
+$clVersion = ''
+$ErrorActionPreference = 'Continue'
+try {
+    $clVersion = (& cl.exe 2>&1 | Select-Object -First 1)
+} finally {
+    $ErrorActionPreference = 'Stop'
+}
+
+if (-not $clVersion) { throw 'cl.exe produced no version banner — the toolset is not usable' }
+
+$linkPath = (Get-Command link.exe -ErrorAction SilentlyContinue).Source
+
+Write-Host 'FxMini toolchain ready'
+Write-Host "  MSVC toolset : $toolset"
+Write-Host "  Windows SDK  : $sdkVersionName"
+Write-Host "  cl.exe       : $clVersion"
+Write-Host "  link.exe     : $linkPath"
+
+if ($linkPath -and $linkPath -notlike "$vcBin*") {
+    Write-Warning "link.exe resolves to $linkPath, not MSVC's. Linking will fail — check PATH order."
+}
+
+Write-Host ''
+Write-Host 'Next: cargo build --release --bin dspcheck'
+
+# Hand the caller's preference back, so that a later `cargo build` is not turned
+# into a terminating error by cargo's own stderr progress output.
+$ErrorActionPreference = $fxmini_previous_eap
