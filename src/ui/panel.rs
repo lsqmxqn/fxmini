@@ -22,7 +22,18 @@
 //! Parameters are shared atomics — the panel stores into `SharedParams` and the
 //! audio thread notices through the generation counter, so slider drags need no
 //! message passing. Only things the *engine* has to do (loading a `.fac`, which
-//! mutates engine state) go through the command channel.
+//! mutates engine state, and saving one, which only the engine can serialise)
+//! go through the command channel.
+//!
+//! ## Saving a preset
+//!
+//! The panel does not write the file. `.fac` is a positional format whose
+//! numbers have to match what `DfxDsp::loadPreset` reads back, and the engine
+//! already owns the serializer that produced every bundled preset — so the
+//! panel asks for a save and *waits to be told what happened*, through
+//! [`EngineStatus::presets_revision`] and [`EngineStatus::last_save`]. The
+//! write lands on another thread; a button that reported success on its own
+//! would be guessing.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,6 +41,7 @@ use std::sync::{mpsc, Arc, OnceLock};
 use std::time::Duration;
 
 use crate::engine::{EngineHandle, EngineStatus, SharedParams, MAX_BANDS, SPECTRUM_BANDS};
+use crate::i18n::{self, PanelText};
 use crate::preset::PresetEntry;
 
 /// Set while a panel window exists, so a second tray click focuses the existing
@@ -162,29 +174,54 @@ fn panel_thread(rx: mpsc::Receiver<PanelShared>) {
 
 /// The five effect knobs, in the order a user expects to see them.
 ///
-/// The third element is the `DfxDsp::Effect` value, which is **not** the order
-/// of the `.fac` `Main` slots — see `preset::MAIN_SLOT_TO_EFFECT`.
-const EFFECTS: [(i32, &str); 5] = [
-    (0, "Fidelity"),
-    (2, "Surround"),
-    (1, "Ambience"),
-    (3, "Dynamic Boost"),
-    (4, "Bass"),
+/// The first element is the `DfxDsp::Effect` value, which is **not** the order
+/// of the `.fac` `Main` slots — see `preset::MAIN_SLOT_TO_EFFECT`. The second is
+/// a lookup into the string table rather than a label, so the list itself stays
+/// language-independent.
+const EFFECTS: [(i32, fn(&PanelText) -> &'static str); 5] = [
+    (0, |t| t.effect_fidelity),
+    (2, |t| t.effect_surround),
+    (1, |t| t.effect_ambience),
+    (3, |t| t.effect_dynamic_boost),
+    (4, |t| t.effect_bass),
 ];
 
 /// Band counts the engine accepts.
 const BAND_CHOICES: [usize; 5] = [5, 10, 15, 20, 31];
 
+/// Width of the label column in the effects and output lists.
+///
+/// Pixels, not `format!("{:<15}")` padding. Character-count padding only lines
+/// up in a fixed-width font, and CJK glyphs are double-width, so padding by
+/// characters puts every slider in the Chinese interface at a different x.
+const LABEL_WIDTH: f32 = 104.0;
+
+/// What the panel shows after a save attempt.
+struct SaveFeedback {
+    message: String,
+    ok: bool,
+}
+
 struct PanelApp {
     shared: PanelShared,
     spectrum: Vec<f32>,
+    /// The name typed into the save box.
+    save_name: String,
+    /// The last save result, shown under the box.
+    save_feedback: Option<SaveFeedback>,
+    /// The preset-folder revision this panel has already reacted to.
+    seen_revision: u64,
 }
 
 impl PanelApp {
     fn new(shared: PanelShared) -> Self {
+        let seen_revision = shared.status.presets_revision();
         Self {
             shared,
             spectrum: vec![0.0; SPECTRUM_BANDS],
+            save_name: String::new(),
+            save_feedback: None,
+            seen_revision,
         }
     }
 
@@ -207,6 +244,139 @@ impl PanelApp {
             }
         }
     }
+
+    /// Asks the engine to write the current settings out as a `.fac`.
+    ///
+    /// Returns nothing: the answer arrives asynchronously through the status,
+    /// because the write happens on the audio thread. See
+    /// [`Self::adopt_preset_changes`].
+    fn request_save(&mut self) {
+        let panel = &i18n::t().panel;
+
+        let name = self.save_name.trim().to_owned();
+        if name.is_empty() {
+            self.save_feedback = Some(SaveFeedback {
+                message: panel.save_name_required.to_owned(),
+                ok: false,
+            });
+            return;
+        }
+        if !is_a_usable_filename(&name) {
+            self.save_feedback = Some(SaveFeedback {
+                message: panel.save_name_invalid.to_owned(),
+                ok: false,
+            });
+            return;
+        }
+
+        let dir = crate::config::presets_dir();
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            log::error!("could not create {}: {err}", dir.display());
+            self.save_feedback = Some(SaveFeedback {
+                message: panel.save_failed.to_owned(),
+                ok: false,
+            });
+            return;
+        }
+
+        // The engine joins this directory with `name + ".fac"` itself, so the
+        // directory is what goes over the wire — see `EngineCommand::SavePreset`.
+        self.shared
+            .handle
+            .send(crate::engine::EngineCommand::SavePreset {
+                name,
+                path: dir,
+            });
+        // Cleared so the message that is about to arrive is unambiguous, and so
+        // a second identical save still produces a visible change.
+        self.save_feedback = None;
+    }
+
+    /// Picks up a save that finished.
+    ///
+    /// Driven by the revision counter rather than by callbacks, the same way
+    /// the tray follows [`SharedParams`]: the audio thread cannot call into the
+    /// UI thread, and polling one integer per frame is free.
+    ///
+    /// The revision has exactly one setter — `EngineStatus::note_preset_written`
+    /// — so a change means a save completed and [`EngineStatus::last_save`] is
+    /// describing *that* save, not an older one.
+    fn adopt_preset_changes(&mut self) {
+        let revision = self.shared.status.presets_revision();
+        if revision == self.seen_revision {
+            return;
+        }
+        self.seen_revision = revision;
+
+        let Some((filename, ok)) = self.shared.status.last_save() else {
+            return;
+        };
+        let panel = &i18n::t().panel;
+
+        if !ok {
+            self.save_feedback = Some(SaveFeedback {
+                message: panel.save_failed.to_owned(),
+                ok: false,
+            });
+            return;
+        }
+
+        // Decided against the list as it stands *before* the rescan: afterwards
+        // the file we just wrote is in there whether it replaced something or
+        // not, and the distinction is the whole reason for saying "overwrote".
+        let overwrote = self.shared.presets.iter().any(|entry| {
+            entry
+                .path
+                .file_name()
+                .is_some_and(|existing| existing == filename.as_str())
+        });
+
+        // Rescan so the new file appears in the combo box on this very frame.
+        self.shared.presets = crate::preset::library();
+
+        // Adopt what we wrote, so the header and the tray agree with the file
+        // that now exists. Left until here rather than done at request time:
+        // until the write is confirmed there may be no such file.
+        let path = crate::config::presets_dir().join(&filename);
+        if path.is_file() {
+            self.shared.status.set_active_preset(Some(&path));
+        }
+
+        self.save_feedback = Some(SaveFeedback {
+            message: panel.saved(&filename, overwrote),
+            ok: true,
+        });
+    }
+}
+
+/// Whether `name` can be used as a Windows filename stem.
+///
+/// The name becomes a filename verbatim — the engine appends `.fac` and joins
+/// it to the preset directory — so anything that changes *where* the file lands
+/// has to be refused here: a separator would let a preset be written anywhere
+/// on disk, and the reserved device names would make the write fail in a way
+/// the user cannot see.
+fn is_a_usable_filename(name: &str) -> bool {
+    const FORBIDDEN: [char; 9] = ['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+
+    if name.contains(FORBIDDEN) || name.contains(char::is_control) {
+        return false;
+    }
+    // Windows silently strips a trailing dot or space, which would make the
+    // name we report differ from the name on disk.
+    if name.ends_with('.') || name.ends_with(' ') {
+        return false;
+    }
+
+    // `CON.fac` is still the console device: the reservation applies to the
+    // stem, whatever the extension.
+    let stem = name.to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0');
+    !reserved
 }
 
 impl eframe::App for PanelApp {
@@ -218,6 +388,11 @@ impl eframe::App for PanelApp {
         // and cloning it here is cheap — it is an `Arc` inside.
         let ctx = ui.ctx().clone();
 
+        // A save that finished since the last frame, or a preset folder that
+        // changed. Done first so the combo box and the footer below both see
+        // the result on this frame rather than the next one.
+        self.adopt_preset_changes();
+
         // Read the meters the audio thread publishes.
         for (index, slot) in self.spectrum.iter_mut().enumerate() {
             *slot = self.shared.status.spectrum(index);
@@ -225,6 +400,7 @@ impl eframe::App for PanelApp {
 
         let params = Arc::clone(&self.shared.params);
         let status = Arc::clone(&self.shared.status);
+        let text = &i18n::t().panel;
 
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(4.0);
@@ -233,18 +409,18 @@ impl eframe::App for PanelApp {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let mut enabled = params.is_enabled();
-                    if ui.checkbox(&mut enabled, "Enabled").changed() {
+                    if ui.checkbox(&mut enabled, text.enabled).changed() {
                         params.set_enabled(enabled);
                     }
 
                     // The dot doubles as a health indicator, so a glance at the
                     // title bar answers "is it actually working?".
                     let (colour, tip) = if status.is_running() {
-                        (egui::Color32::from_rgb(0x3d, 0xdc, 0x97), "processing")
+                        (egui::Color32::from_rgb(0x3d, 0xdc, 0x97), text.status_processing)
                     } else if status.virtual_present() {
-                        (egui::Color32::from_rgb(0xf5, 0xa6, 0x23), "idle")
+                        (egui::Color32::from_rgb(0xf5, 0xa6, 0x23), text.status_idle)
                     } else {
-                        (egui::Color32::from_rgb(0xd9, 0x53, 0x4f), "no virtual sound card")
+                        (egui::Color32::from_rgb(0xd9, 0x53, 0x4f), text.status_no_card)
                     };
                     ui.colored_label(colour, "●").on_hover_text(tip);
                 });
@@ -252,29 +428,65 @@ impl eframe::App for PanelApp {
             ui.add_space(4.0);
         });
 
+        // The footer is where a save happens: it is the one part of the window
+        // that is always on screen, so "tune, then save" never needs a scroll.
         egui::Panel::bottom("footer").show(ui, |ui| {
             ui.add_space(3.0);
+
+            ui.horizontal(|ui| {
+                ui.label(text.save_heading);
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut self.save_name)
+                        .hint_text(text.save_name_hint)
+                        .desired_width(180.0),
+                );
+                // Enter is the same as clicking Save. After tuning, the name box
+                // is where the cursor already is, so it is the shorter path.
+                let pressed_enter =
+                    field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if ui.button(text.save_button).clicked() || pressed_enter {
+                    self.request_save();
+                }
+            });
+            match &self.save_feedback {
+                Some(feedback) => {
+                    let colour = if feedback.ok {
+                        egui::Color32::from_rgb(0x3d, 0xdc, 0x97)
+                    } else {
+                        egui::Color32::from_rgb(0xd9, 0x53, 0x4f)
+                    };
+                    // `RichText::small`, not `ui.small`: the latter returns a
+                    // `Response`, which is not something a label can be made of.
+                    ui.colored_label(colour, egui::RichText::new(&feedback.message).small());
+                }
+                None => {
+                    ui.small(text.save_help);
+                }
+            }
+
+            ui.separator();
+
             ui.horizontal_wrapped(|ui| {
                 ui.small(match status.source_description() {
-                    Some(description) => format!("in:  {description}"),
-                    None => "in:  —".to_owned(),
+                    Some(description) => text.input_line(Some(&description)),
+                    None => text.input_line(None),
                 });
             });
             ui.horizontal_wrapped(|ui| {
                 ui.small(match status.sink_description() {
-                    Some(description) => format!("out: {description}"),
-                    None => "out: —".to_owned(),
+                    Some(description) => text.output_line(Some(&description)),
+                    None => text.output_line(None),
                 });
             });
             if let Some(error) = status.last_error() {
                 ui.colored_label(egui::Color32::from_rgb(0xd9, 0x53, 0x4f), format!("⚠ {error}"));
             }
             ui.horizontal(|ui| {
-                ui.small(format!("latency {} ms", status.latency_ms()));
+                ui.small(text.latency(status.latency_ms()));
                 ui.separator();
-                ui.small(format!("underruns {}", status.underruns()));
+                ui.small(text.underruns(status.underruns()));
                 ui.separator();
-                ui.small(format!("drops {}", status.overruns()));
+                ui.small(text.drops(status.overruns()));
             });
             ui.add_space(3.0);
         });
@@ -286,11 +498,11 @@ impl eframe::App for PanelApp {
                 self.effects_section(ui, &params);
                 ui.separator();
 
-                egui::CollapsingHeader::new("Equalizer")
+                egui::CollapsingHeader::new(text.equalizer)
                     .default_open(true)
                     .show(ui, |ui| {
                         let mut eq_on = params.eq_on();
-                        if ui.checkbox(&mut eq_on, "Enabled").changed() {
+                        if ui.checkbox(&mut eq_on, text.enabled).changed() {
                             params.set_eq_on(eq_on);
                         }
                         self.eq_section(ui, &params);
@@ -313,13 +525,15 @@ impl PanelApp {
     fn preset_section(&mut self, ui: &mut eframe::egui::Ui) {
         use eframe::egui;
 
+        let text = &i18n::t().panel;
+
         // Read the selection from the shared status rather than from a snapshot
         // taken when the window opened, so a preset changed from the tray menu
         // shows up here as well.
         let active = self.shared.status.active_preset().map(PathBuf::from);
 
         ui.horizontal(|ui| {
-            ui.label("Preset");
+            ui.label(text.preset);
             let current = active
                 .as_ref()
                 .and_then(|path| {
@@ -329,7 +543,7 @@ impl PanelApp {
                         .find(|entry| &entry.path == path)
                         .map(|entry| entry.name.clone())
                 })
-                .unwrap_or_else(|| "—".to_owned());
+                .unwrap_or_else(|| text.no_selection.to_owned());
 
             egui::ComboBox::from_id_salt("preset-combo")
                 .selected_text(current)
@@ -353,13 +567,15 @@ impl PanelApp {
     }
 
     fn effects_section(&mut self, ui: &mut eframe::egui::Ui, params: &Arc<SharedParams>) {
-        ui.heading("Effects");
+        let text = &i18n::t().panel;
+
+        ui.heading(text.effects);
         ui.add_space(2.0);
 
         for (id, label) in EFFECTS {
             let mut value = params.effect(id);
             ui.horizontal(|ui| {
-                ui.label(format!("{label:<14}"));
+                label_column(ui, label(text));
                 if ui
                     .add(
                         eframe::egui::Slider::new(&mut value, 0.0..=10.0)
@@ -376,10 +592,11 @@ impl PanelApp {
     }
 
     fn eq_section(&mut self, ui: &mut eframe::egui::Ui, params: &Arc<SharedParams>) {
+        let text = &i18n::t().panel;
         let bands = params.num_bands().min(MAX_BANDS);
 
         ui.horizontal(|ui| {
-            ui.label("Bands");
+            ui.label(text.bands);
             let mut chosen = bands;
             eframe::egui::ComboBox::from_id_salt("band-count")
                 .selected_text(bands.to_string())
@@ -429,20 +646,22 @@ impl PanelApp {
     }
 
     fn output_section(&mut self, ui: &mut eframe::egui::Ui, params: &Arc<SharedParams>) {
-        ui.heading("Output");
+        let text = &i18n::t().panel;
+
+        ui.heading(text.output);
         ui.add_space(2.0);
 
         let rows: [(&str, fn(&SharedParams) -> f32, fn(&SharedParams, f32), f32, f32); 4] = [
-            ("Balance", SharedParams::balance, SharedParams::set_balance, -20.0, 20.0),
-            ("Master gain", SharedParams::master_gain, SharedParams::set_master_gain, -20.0, 20.0),
-            ("Normalization", SharedParams::normalization, SharedParams::set_normalization, 0.0, 4.0),
-            ("Volume leveling", SharedParams::volume_leveling, SharedParams::set_volume_leveling, 0.0, 4.0),
+            (text.balance, SharedParams::balance, SharedParams::set_balance, -20.0, 20.0),
+            (text.master_gain, SharedParams::master_gain, SharedParams::set_master_gain, -20.0, 20.0),
+            (text.normalization, SharedParams::normalization, SharedParams::set_normalization, 0.0, 4.0),
+            (text.volume_leveling, SharedParams::volume_leveling, SharedParams::set_volume_leveling, 0.0, 4.0),
         ];
 
         for (label, get, set, min, max) in rows {
             let mut value = get(params);
             ui.horizontal(|ui| {
-                ui.label(format!("{label:<15}"));
+                label_column(ui, label);
                 if ui
                     .add(
                         eframe::egui::Slider::new(&mut value, min..=max)
@@ -458,7 +677,7 @@ impl PanelApp {
 
         let mut q = params.filter_q();
         ui.horizontal(|ui| {
-            ui.label(format!("{:<15}", "Filter Q"));
+            label_column(ui, text.filter_q);
             if ui
                 .add(eframe::egui::Slider::new(&mut q, 1.0..=3.0).show_value(false))
                 .changed()
@@ -472,7 +691,7 @@ impl PanelApp {
     fn meter_section(&mut self, ui: &mut eframe::egui::Ui) {
         use eframe::egui;
 
-        ui.heading("Spectrum");
+        ui.heading(i18n::t().panel.spectrum);
         ui.add_space(2.0);
 
         let (rect, _) =
@@ -501,6 +720,19 @@ impl PanelApp {
             painter.rect_filled(bar, 1.0, colour);
         }
     }
+}
+
+/// Draws a label in the fixed-width column the sliders line up against.
+///
+/// `add_sized` rather than `format!("{label:<14}")`: character padding only
+/// aligns in a monospace face, and a CJK glyph is twice as wide as a Latin one,
+/// so counting characters would give each row a different label width in the
+/// Chinese interface and the sliders would start at a different x every line.
+fn label_column(ui: &mut eframe::egui::Ui, text: &str) {
+    ui.add_sized(
+        [LABEL_WIDTH, ui.spacing().interact_size.y],
+        eframe::egui::Label::new(text),
+    );
 }
 
 /// Registers a CJK-capable font from the system, so preset names like
@@ -560,6 +792,48 @@ mod tests {
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowW, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
     };
+
+    #[test]
+    fn a_preset_name_cannot_escape_the_preset_folder() {
+        // The name becomes a filename verbatim, so a separator would let a
+        // preset be written anywhere the process can write.
+        for bad in [
+            r"..\..\evil",
+            "a/b",
+            r"C:\Windows\System32\x",
+            "trailing.",
+            "trailing ",
+            "with:colon",
+            "star*",
+            "quote\"",
+            "pipe|",
+            "less<more",
+            "question?",
+            "new\nline",
+            "nul\u{0}byte",
+        ] {
+            assert!(!is_a_usable_filename(bad), "{bad:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn reserved_device_names_are_refused_whatever_the_extension() {
+        // `CON.fac` is still the console: the reservation is on the stem.
+        for bad in ["CON", "con", "PRN", "AUX", "NUL", "COM1", "lpt9"] {
+            assert!(!is_a_usable_filename(bad), "{bad:?} should be refused");
+        }
+        // …but only the exact stem, and only digits 1-9.
+        for good in ["CON2", "COM0", "LPT", "COM10", "CONSOLE", "My Preset 1"] {
+            assert!(is_a_usable_filename(good), "{good:?} should be allowed");
+        }
+    }
+
+    #[test]
+    fn ordinary_names_are_usable() {
+        for good in ["音乐", "Bass boost", "My Tune (v2)", "低音_2"] {
+            assert!(is_a_usable_filename(good), "{good:?} should be allowed");
+        }
+    }
 
     /// This process's panel window, if one is up.
     ///

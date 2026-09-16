@@ -74,6 +74,14 @@ pub struct Config {
 
     /// Log verbosity: "off" | "error" | "warn" | "info" | "debug" | "trace".
     pub log_level: String,
+
+    /// Interface language: "auto" | "zh" | "en".
+    ///
+    /// `"auto"` defers to the Windows UI language, and it is stored as a
+    /// *string* rather than as a resolved value so that a user who set it
+    /// explicitly keeps that choice, while a user who never touched it follows
+    /// their system when they change it. See [`crate::i18n::resolve`].
+    pub language: String,
 }
 
 impl Default for Config {
@@ -91,6 +99,7 @@ impl Default for Config {
             resample_on_rate_mismatch: true,
             bypass_mono_devices: true,
             log_level: "info".to_owned(),
+            language: crate::i18n::AUTO.to_owned(),
         }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "fxmini"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Tray-resident FxSound-compatible audio enhancer, without the FxSound app"
@@ -35,7 +35,7 @@ winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
 # Windows needs no feature flag; the crate's features are all Linux/macOS
 # backends, and enabling them drags GTK into the lock file for nothing.
 tray-icon = { version = "0.25.0", default-features = false }
-windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_Media_KernelStreaming", "Win32_Media_Multimedia", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Devices_DeviceAndDriverInstallation", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_UI_Shell_PropertiesSystem"] }
+windows = { version = "0.62.2", features = ["Win32_Media_Audio", "Win32_Media_KernelStreaming", "Win32_Media_Multimedia", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Devices_DeviceAndDriverInstallation", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_Security", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_UI_Shell_PropertiesSystem", "Win32_Globalization"] }
 windows-core = { version = "0.62", features = ["std"] }
 
 [profile.release]

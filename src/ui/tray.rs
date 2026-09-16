@@ -16,6 +16,16 @@
 //! whenever the driver state changes, which invalidates ids and races with the
 //! event queue. Instead both are always present and one is disabled — the same
 //! thing the Sound control panel does.
+//!
+//! ## Language
+//!
+//! Every label comes from [`crate::i18n`] and is a single language, not the
+//! bilingual `启用音效 / Enabled` this used to show. A menu is scanned from the
+//! screen edge, where a wide label is clipped rather than wrapped, so doubling
+//! its length to serve a reader who only needs half of it was costing the one
+//! thing the menu is short of. Changing the language rebuilds the whole tray
+//! (`app::App::set_language`) rather than mutating labels in place: `muda` has
+//! no text setter for an existing item, so a rebuild is the only option.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +35,7 @@ use tray_icon::menu::{
 };
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
+use crate::i18n::{self, Lang};
 use crate::preset::PresetEntry;
 
 /// Something the user asked for through the tray.
@@ -47,6 +58,8 @@ pub enum TrayAction {
     /// Point the system's default output at the virtual sound card, so audio
     /// actually flows through the enhancer.
     RouteOutput,
+    /// Draw the interface in a different language.
+    SetLanguage(Lang),
     /// Leave.
     Quit,
 }
@@ -73,30 +86,40 @@ pub struct Tray {
 }
 
 impl Tray {
-    /// Builds the icon and menu.
+    /// Builds the icon and menu, in the language [`i18n::current`] reports.
     pub fn new(
         presets: &[PresetEntry],
         enabled: bool,
         autostart: bool,
         driver_present: bool,
     ) -> Result<Self, String> {
+        let text = &i18n::t().tray;
         let menu = Menu::new();
 
-        let enabled_item = CheckMenuItem::new("启用音效 / Enabled", true, enabled, None);
-        let route_item =
-            MenuItem::new("输出走 FxMini 增强 / Route output through FxMini", true, None);
-        let open_item = MenuItem::new("调音面板… / Tuning panel", true, None);
-        let preset_menu = Submenu::new("预设 / Preset", true);
-        let autostart_item =
-            CheckMenuItem::new("开机自启 / Start with Windows", true, autostart, None);
-        let install_item =
-            MenuItem::new("安装虚拟声卡驱动… / Install virtual sound card", true, None);
-        let remove_item =
-            MenuItem::new("卸载虚拟声卡驱动 / Remove virtual sound card", true, None);
-        let reload_item = MenuItem::new("重新扫描预设 / Rescan presets", true, None);
-        let quit_item = MenuItem::new("退出 / Quit", true, None);
+        let enabled_item = CheckMenuItem::new(text.enabled, true, enabled, None);
+        let route_item = MenuItem::new(text.route_through, true, None);
+        let open_item = MenuItem::new(text.panel, true, None);
+        let preset_menu = Submenu::new(text.presets, true);
+        let autostart_item = CheckMenuItem::new(text.autostart, true, autostart, None);
+        let install_item = MenuItem::new(text.install_driver, true, None);
+        let remove_item = MenuItem::new(text.remove_driver, true, None);
+        let reload_item = MenuItem::new(text.rescan, true, None);
+        let quit_item = MenuItem::new(text.quit, true, None);
 
-        let actions: HashMap<MenuId, TrayAction> = [
+        // The language submenu. Its entries are endonyms — "中文" and
+        // "English" — so the way out of a language you cannot read is legible
+        // in that language.
+        let language_menu = Submenu::new(text.language, true);
+        let current = i18n::current();
+        let mut language_items = Vec::with_capacity(Lang::ALL.len());
+        for lang in Lang::ALL {
+            let item = CheckMenuItem::new(lang.endonym(), true, lang == current, None);
+            if language_menu.append(&item).is_ok() {
+                language_items.push((item.id().clone(), lang));
+            }
+        }
+
+        let mut actions: HashMap<MenuId, TrayAction> = [
             (enabled_item.id().clone(), TrayAction::ToggleEnabled),
             (route_item.id().clone(), TrayAction::RouteOutput),
             (open_item.id().clone(), TrayAction::OpenPanel),
@@ -109,6 +132,10 @@ impl Tray {
         .into_iter()
         .collect();
 
+        for (id, lang) in language_items {
+            actions.insert(id, TrayAction::SetLanguage(lang));
+        }
+
         menu.append(&enabled_item).map_err(stringify)?;
         menu.append(&route_item).map_err(stringify)?;
         menu.append(&open_item).map_err(stringify)?;
@@ -116,6 +143,7 @@ impl Tray {
         menu.append(&PredefinedMenuItem::separator())
             .map_err(stringify)?;
         menu.append(&autostart_item).map_err(stringify)?;
+        menu.append(&language_menu).map_err(stringify)?;
         menu.append(&PredefinedMenuItem::separator())
             .map_err(stringify)?;
         menu.append(&install_item).map_err(stringify)?;
@@ -159,7 +187,7 @@ impl Tray {
         }
 
         if presets.is_empty() {
-            let empty = MenuItem::new("(未找到预设 / none found)", false, None);
+            let empty = MenuItem::new(i18n::t().tray.no_presets, false, None);
             let _ = self.preset_menu.append(&empty);
             return;
         }

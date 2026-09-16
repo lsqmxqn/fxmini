@@ -638,6 +638,21 @@ pub struct EngineStatus {
     /// panel can both change it, and each has to be able to see the other's
     /// choice. The app owns the reconciliation against the config file.
     active_preset: Mutex<Option<String>>,
+    /// Bumped every time a preset file is written into the preset folder.
+    ///
+    /// The save itself happens on the audio thread — only the engine holds the
+    /// `DfxDsp` whose state is being serialised — so the tray and the panel
+    /// cannot learn about it by watching their own call paths. They compare
+    /// this against the value they last saw and rescan when it moves, which
+    /// also covers a file dropped in by hand, since `App::refresh` rescans on
+    /// the same signal.
+    presets_revision: AtomicU64,
+    /// Outcome of the most recent save: `(filename, succeeded)`.
+    ///
+    /// Read by the panel to report what happened. A `Mutex` rather than an
+    /// atomic because it is two values that must agree with each other, and it
+    /// is only touched once per user click.
+    last_save: Mutex<Option<(String, bool)>>,
     /// Last error worth showing the user.
     last_error: Mutex<Option<String>>,
 }
@@ -715,6 +730,30 @@ impl EngineStatus {
         }
     }
 
+    /// How many times the preset folder has gained or lost a file.
+    ///
+    /// Polled, not consumed: every reader keeps its own last-seen value, so the
+    /// tray and the panel can both notice without racing each other.
+    pub fn presets_revision(&self) -> u64 {
+        self.presets_revision.load(Ordering::Relaxed)
+    }
+
+    /// Publishes the outcome of a preset save and bumps the folder revision.
+    ///
+    /// Called from the audio thread right after the engine has written the
+    /// file, which is the only place that knows whether the write worked.
+    fn note_preset_written(&self, filename: String, ok: bool) {
+        if let Ok(mut slot) = self.last_save.lock() {
+            *slot = Some((filename, ok));
+        }
+        self.presets_revision.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The outcome of the most recent save, if there has been one.
+    pub fn last_save(&self) -> Option<(String, bool)> {
+        self.last_save.lock().ok()?.clone()
+    }
+
     pub fn last_error(&self) -> Option<String> {
         self.last_error.lock().ok()?.clone()
     }
@@ -765,6 +804,9 @@ pub enum EngineCommand {
     /// only performs the engine call.
     LoadPreset { path: PathBuf, preset: crate::preset::FacPreset },
     /// Persist the engine's current state to a `.fac` file.
+    ///
+    /// `path` is the **directory** to write into, not the file: the engine
+    /// builds the filename from `name` and appends `.fac` to it.
     SavePreset { name: String, path: PathBuf },
     /// Tear the graph down and build it again, e.g. after the user picked a
     /// different endpoint.
@@ -1572,9 +1614,18 @@ fn run_graph(
                     applier.last_generation = 0; // force a refresh
                 }
                 Ok(EngineCommand::SavePreset { name, path }) => {
-                    if !dsp.save_preset(&name, &path) {
-                        log::error!("could not write preset to {}", path.display());
+                    // `path` is the *directory*: the engine appends ".fac" to
+                    // the name and joins the two itself (see `valsSave`), so
+                    // passing a full file path would land the file in a
+                    // subdirectory named after the preset.
+                    let ok = dsp.save_preset(&name, &path);
+                    if !ok {
+                        log::error!("could not write preset {name:?} to {}", path.display());
                     }
+                    // Reported back so the panel can say what happened: the
+                    // write happens here, on the audio thread, and the UI has
+                    // no other way to tell success from failure.
+                    status.note_preset_written(format!("{name}.fac"), ok);
                 }
                 Ok(EngineCommand::SetEnabled(on)) => params.set_enabled(on),
                 Ok(EngineCommand::SetEqOn(on)) => params.set_eq_on(on),
@@ -2073,5 +2124,75 @@ mod tests {
         // thread reads these.
         params.set_effect(99, 1.0);
         params.set_band_gain(999, 1.0);
+    }
+
+    /// Saving is the one place the panel's "save as preset" can go wrong
+    /// silently, so the whole contract is pinned here.
+    ///
+    /// Two halves, both non-obvious:
+    ///
+    /// * [`EngineCommand::SavePreset`] carries a **directory**, because the
+    ///   engine appends `.fac` to the name and joins the two itself. Handing it
+    ///   a file path makes the write fail and, before this test existed, nothing
+    ///   said so.
+    /// * The bytes it writes have to come back through *our* parser, since that
+    ///   parser is what builds the preset list the new file has to appear in.
+    ///
+    /// Needs no audio hardware — `Dsp::new` only allocates — so it runs in CI.
+    #[test]
+    fn saving_a_preset_writes_a_file_our_parser_can_read_back() {
+        let dir = std::env::temp_dir().join(format!("fxmini-save-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+
+        let dsp = Dsp::new().expect("DfxDsp allocation failed");
+        // Upstream documents that the first call after construction can fail;
+        // `dspcheck` does the same two-call dance.
+        dsp.set_signal_format(32, 2, 48_000, 32);
+        dsp.set_signal_format(32, 2, 48_000, 32);
+
+        // Something to save, so the file cannot be "correct" by being empty.
+        dsp.set_effect(ffi::DFX_EFFECT_BASS, 7.0);
+
+        // A space and a non-ASCII character on purpose: that is what the panel
+        // hands over, and the engine has to write it as UTF-8 in the name line.
+        let name = "Save check 测试";
+        assert!(
+            dsp.save_preset(name, &dir),
+            "save_preset refused a directory"
+        );
+
+        let written = dir.join(format!("{name}.fac"));
+        assert!(
+            written.is_file(),
+            "save_preset(name, dir) should produce {:?} — if this fails, the \
+             argument meanings have changed and the panel is writing elsewhere",
+            written
+        );
+
+        let parsed = crate::preset::FacPreset::from_file(&written).expect("our parser reads it");
+        assert_eq!(parsed.name, name, "the name line did not survive the round trip");
+
+        let bass = parsed
+            .effect_slider_value(ffi::DFX_EFFECT_BASS)
+            .expect("Bass has a Main slot");
+        assert!(
+            (bass - 7.0).abs() < 0.2,
+            "the save did not capture the live state: Bass came back as {bass}, expected 7.0"
+        );
+
+        // And the trap itself: a *file* path lands one level too deep, so the
+        // wrapper must refuse it up front. It has to return `false` quickly —
+        // letting it reach the engine has been observed to hang, which is why
+        // the guard lives in `ffi::Dsp::save_preset` and is asserted here so a
+        // future change to either meaning is loud.
+        assert!(
+            !dsp.save_preset("nested", &dir.join("nested.fac")),
+            "passing a file path to save_preset should be refused"
+        );
+        // Nothing must have been created a level too deep.
+        assert!(!dir.join("nested.fac").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

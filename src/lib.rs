@@ -16,6 +16,7 @@
 //! | [`engine`] | the audio thread: loopback capture → DSP → render |
 //! | [`driver`] | detecting, installing and removing the virtual sound card |
 //! | [`autostart`] | the `HKCU\...\Run` entry |
+//! | [`i18n`] | every user-visible string, in Chinese and English |
 //! | [`ui`] | the tray icon and the tuning panel |
 //! | [`app`] | wiring between the tray, the engine and the config |
 //!
@@ -29,6 +30,7 @@ pub mod device;
 pub mod driver;
 pub mod engine;
 pub mod ffi;
+pub mod i18n;
 pub mod preset;
 pub mod routing;
 pub mod ui;

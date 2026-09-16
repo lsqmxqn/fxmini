@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::device;
 use crate::driver;
 use crate::engine::{AudioEngine, EngineHandle, EngineStatus, SharedParams};
+use crate::i18n::{self, Lang};
 use crate::preset::{self, PresetEntry};
 use crate::routing::{EngageOutcome, Routing};
 use crate::ui::panel::{self, PanelShared};
@@ -35,11 +36,29 @@ pub struct App {
     /// fresh reason to try.
     routing_attempted: bool,
     last_refresh: Instant,
+    /// The preset-folder revision this app has already reacted to.
+    ///
+    /// The panel saves presets by asking the engine to write the file, which
+    /// happens on the audio thread, so the tray cannot learn about it from its
+    /// own call paths. It compares this against
+    /// [`EngineStatus::presets_revision`] once a second instead.
+    seen_presets_revision: u64,
 }
 
 impl App {
     /// Prepares everything and puts the tray icon on screen.
     pub fn start(mut config: Config) -> Result<Self, String> {
+        // Before the tray is built, because every one of its labels is drawn
+        // from the string table and there is no way to relabel an existing
+        // menu item — see `ui::tray`.
+        let language = i18n::resolve(&config.language);
+        i18n::set(language);
+        log::info!(
+            "interface language: {} ({})",
+            language.endonym(),
+            config.language
+        );
+
         // Bundled presets are unpacked before anything reads the folder, so the
         // first run already has a populated menu.
         if let Err(err) = preset::unpack_embedded_presets() {
@@ -141,6 +160,7 @@ impl App {
             routing,
             routing_attempted: config.take_over_default,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
+            seen_presets_revision: 0,
             config,
         };
 
@@ -168,6 +188,7 @@ impl App {
             Some(TrayAction::RemoveDriver) => self.request_driver_removal(),
             Some(TrayAction::ReloadPresets) => self.reload_presets(),
             Some(TrayAction::RouteOutput) => self.route_output(),
+            Some(TrayAction::SetLanguage(language)) => self.set_language(language),
             None => {}
         }
         false
@@ -206,6 +227,17 @@ impl App {
         // An owned handle rather than a borrow: the late takeover below needs
         // `&mut self`, and a reference into `self` would still be live here.
         let status = std::sync::Arc::clone(self.handle.status());
+
+        // A preset was written by the panel (the engine does the writing, so
+        // nothing on this thread saw it happen). Rescanning here is what puts
+        // the new preset into the tray menu; the panel rescans its own copy off
+        // the same counter.
+        let revision = status.presets_revision();
+        if revision != self.seen_presets_revision {
+            self.seen_presets_revision = revision;
+            self.reload_presets();
+        }
+
         let driver_present = status.virtual_present() || device::virtual_device_present();
         self.tray.set_driver_present(driver_present);
 
@@ -239,30 +271,23 @@ impl App {
         let routed = crate::routing::default_is_routed_through_card();
         self.tray.set_routed(routed);
 
+        let text = &i18n::t().tray;
         let tooltip = if !driver_present {
-            "FxMini — virtual sound card not installed".to_owned()
+            text.tooltip_no_card.to_owned()
         } else if !self.handle.params().is_enabled() {
-            "FxMini — disabled".to_owned()
+            text.tooltip_disabled.to_owned()
         } else if status.is_running() {
             // The distinction that matters to a user reporting "nothing
             // changed": audio is being processed, or the enhancer is being
             // bypassed by the system's own routing.
-            let route_note = if self.config.take_over_default && !routed {
-                " — output is NOT enhanced (default device is not the virtual card)"
-            } else {
-                ""
-            };
-            format!(
-                "FxMini — {}{}{}",
-                self.active_name().unwrap_or_else(|| "no preset".to_owned()),
-                match status.last_error() {
-                    Some(error) => format!(" ({error})"),
-                    None => String::new(),
-                },
-                route_note
+            let route_lost = self.config.take_over_default && !routed;
+            text.tooltip_playing(
+                self.active_name().as_deref(),
+                status.last_error().as_deref(),
+                route_lost,
             )
         } else {
-            "FxMini — idle".to_owned()
+            text.tooltip_idle.to_owned()
         };
         self.tray.set_tooltip(&tooltip);
     }
@@ -376,6 +401,58 @@ impl App {
         self.tray.set_presets(&self.presets);
         self.tray.set_active_preset(self.active_preset.as_deref());
         log::info!("preset list refreshed: {} entries", self.presets.len());
+    }
+
+    /// Switches the interface language and rebuilds the tray menu.
+    ///
+    /// The menu has to be rebuilt rather than relabelled: `muda` exposes no text
+    /// setter, so there is no way to change a label on an item that already
+    /// exists. The notification-area icon is recreated along with the menu,
+    /// which is visible as a blink — cheaper than keeping a shadow copy of
+    /// every label to patch in later.
+    ///
+    /// The panel needs none of this: it re-reads the string table each frame,
+    /// so an open panel changes language on its next repaint.
+    fn set_language(&mut self, language: Lang) {
+        let previous = i18n::current();
+        if language == previous {
+            return;
+        }
+
+        i18n::set(language);
+        let status = std::sync::Arc::clone(self.handle.status());
+        let driver_present = status.virtual_present() || device::virtual_device_present();
+        let rebuilt = Tray::new(
+            &self.presets,
+            self.handle.params().is_enabled(),
+            crate::autostart::is_enabled(),
+            driver_present,
+        );
+
+        let tray = match rebuilt {
+            Ok(tray) => tray,
+            Err(err) => {
+                // Put the strings back rather than leave the panel in one
+                // language and the menu in another.
+                i18n::set(previous);
+                log::error!("could not rebuild the tray menu in {}: {err}", language.endonym());
+                return;
+            }
+        };
+        self.tray = tray;
+
+        // `Tray::new` ticks nothing: the preset selection is state this struct
+        // owns, so the freshly built menu has to be told about it.
+        self.tray.set_active_preset(self.active_preset.as_deref());
+
+        // Recorded as an explicit choice, replacing "auto": the user has now
+        // said which language they want, and a later change to the system
+        // language should not undo it.
+        self.config.language = language.code().to_owned();
+        self.save_config();
+        log::info!("interface language switched to {}", language.endonym());
+
+        self.refresh();
     }
 
     /// Points the system's default output at the virtual card, once.

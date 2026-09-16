@@ -172,9 +172,25 @@ impl Dsp {
         unsafe { dfxdsp_load_preset(self.handle, wide.as_ptr()) == DFXDSP_OK }
     }
 
-    pub fn save_preset(&self, name: &str, path: &Path) -> bool {
+    /// Writes the live engine state as `<name>.fac` **inside `dir`**.
+    ///
+    /// `dir` must already exist and be a directory. The engine composes the
+    /// final path itself (`valsSave` does `swprintf(L"%s\\%s", dir, name)`) and
+    /// appends `.fac` to the name, so passing a *file* path would target
+    /// `<file>\<name>.fac` — which cannot be created. Upstream does not fail
+    /// cleanly in that case: the call has been observed to never return with a
+    /// non-directory path, which would wedge the engine thread mid-command and
+    /// permanently stop preset saves. We therefore refuse anything that is not
+    /// an existing directory *before* crossing the FFI boundary, so a caller
+    /// gets a fast `false` instead of a hang.
+    ///
+    /// This is a syscall on the engine thread, never the audio thread.
+    pub fn save_preset(&self, name: &str, dir: &Path) -> bool {
+        if name.is_empty() || !dir.is_dir() {
+            return false;
+        }
         let wide_name = to_wide_str(name);
-        let wide_path = to_wide(path.as_os_str());
+        let wide_path = to_wide(dir.as_os_str());
         unsafe { dfxdsp_save_preset(self.handle, wide_name.as_ptr(), wide_path.as_ptr()) == DFXDSP_OK }
     }
 
