@@ -1,4 +1,4 @@
-# FxMini — set up the MSVC + Windows SDK build environment.
+﻿# FxMini — set up the MSVC + Windows SDK build environment.
 #
 #   . .\toolchain.ps1                       # auto-detect
 #   cargo build --release --bin dspcheck

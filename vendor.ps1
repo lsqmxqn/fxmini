@@ -1,4 +1,4 @@
-# FxMini — vendor the FxSound DSP engine and the support layer it depends on.
+﻿# FxMini — vendor the FxSound DSP engine and the support layer it depends on.
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File vendor.ps1 `
 #       -Source ..\fxsound-app -Dest .

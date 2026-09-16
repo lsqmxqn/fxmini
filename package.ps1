@@ -1,4 +1,4 @@
-# FxMini — M6 packaging.
+﻿# FxMini — M6 packaging.
 #
 #   .\package.ps1                 # build, assemble, zip
 #   .\package.ps1 -NoBuild        # re-package whatever is already in target\release

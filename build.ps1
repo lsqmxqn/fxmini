@@ -1,4 +1,4 @@
-# FxMini — one-command build.
+﻿# FxMini — one-command build.
 #
 #   .\build.ps1                            # build the dspcheck smoke test
 #   .\build.ps1 --release --bin fxmini     # build something else
