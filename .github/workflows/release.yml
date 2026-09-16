@@ -1,0 +1,143 @@
+# Build the distributable and, on a version tag, publish it as a GitHub Release.
+#
+# Two entry points, deliberately different:
+#
+#   * pushing a tag `vX.Y.Z`  -> package, check the tag against Cargo.toml, and
+#                                attach the zip + SHA256SUMS to a Release;
+#   * manual dispatch         -> package and upload the zip as a workflow
+#                                artifact, and publish nothing. This is how the
+#                                packaging path gets tested without creating a
+#                                public release as a side effect.
+#
+# To cut a release:
+#
+#   # Cargo.toml must already say version = "X.Y.Z"
+#   git tag vX.Y.Z
+#   git push origin vX.Y.Z
+#
+# The licence and the driver's provenance are restated in the release body on
+# purpose: it is the page people land on when they are looking for a download,
+# and two of the three things in the zip are not FxMini's own work.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: package
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    # Needed to create the Release. Nothing else in this workflow writes.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Read the version from Cargo.toml
+        id: ver
+        shell: pwsh
+        run: |
+          $toml = Get-Content Cargo.toml -Raw
+          if ($toml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+            throw 'could not read `version` from Cargo.toml'
+          }
+          $version = $Matches[1]
+          Write-Host "Cargo.toml version: $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      # A release whose tag and version disagree is worse than no release: the
+      # zip is named after the version and the tag is what people cite, so the
+      # two must not drift. Only meaningful for a tag build.
+      - name: Check the tag matches the version
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $tag = $env:TAG -replace '^v', ''
+          $version = '${{ steps.ver.outputs.version }}'
+          if ($tag -ne $version) {
+            throw "tag '$env:TAG' does not match Cargo.toml version '$version'. Bump the version, or retag."
+          }
+          Write-Host "tag $env:TAG matches version $version"
+
+      # Builds, then asserts the icon / version resource and the absence of a
+      # VC++ redistributable import, then assembles and zips. It also locates the
+      # driver in driver/, which is why the three signed files are committed to
+      # this repository: a runner has no sibling checkout to fall back to.
+      - name: Package
+        shell: pwsh
+        run: ./package.ps1 --locked
+
+      - name: Show what was produced
+        shell: pwsh
+        run: |
+          Get-ChildItem dist -Recurse -File | ForEach-Object {
+            '{0,12:N0}  {1}' -f $_.Length, $_.FullName
+          }
+          ''
+          Get-Content dist/SHA256SUMS.txt
+
+      - name: Upload the zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: FxMini-${{ steps.ver.outputs.version }}-win64
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish the release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: FxMini ${{ steps.ver.outputs.version }}
+          files: |
+            dist/FxMini-${{ steps.ver.outputs.version }}-win64.zip
+            dist/SHA256SUMS.txt
+          body: |
+            Tray-resident Windows audio enhancer, built from this tag on a GitHub
+            runner. `FxMini-${{ steps.ver.outputs.version }}-win64.zip` unpacks to a
+            portable `FxMini\` folder — no installer, no administrator rights to
+            just run it.
+
+            **Install**
+
+            1. Unpack anywhere, run `fxmini.exe`, look for the tray icon.
+            2. Right-click it → *Install virtual sound card*, accept the elevation
+               prompt. (This step needs administrator rights; until it is done
+               there is nothing for the enhancer to sit in front of.)
+            3. Right-click it → *Route output through FxMini*.
+
+            `--restore-output` (or the tray menu's *Route output* → *Quit*) hands
+            the system's default output back to a real device. Run it if a crash
+            ever leaves the machine silent.
+
+            **Licence**
+
+            AGPL-3.0-or-later. The DSP engine and the virtual sound card driver
+            come from FxSound's AGPL-3.0 sources, and the driver binaries in
+            `driver/` are FxSound's signed package redistributed unmodified.
+            "FxSound" and its artwork belong to their owner; FxMini is an
+            independent, unaffiliated project.
+
+            Generated with WorkBuddy (DeepSeek-V4.1-Flash) — see the README's AI
+            provenance section.

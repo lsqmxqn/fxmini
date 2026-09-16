@@ -3,6 +3,8 @@
 #   .\package.ps1                 # build, assemble, zip
 #   .\package.ps1 -NoBuild        # re-package whatever is already in target\release
 #   .\package.ps1 -NoZip          # leave the folder, skip the archive
+#   .\package.ps1 -Locked         # pass --locked to cargo; CI uses this so the
+#                                 # committed Cargo.lock is what actually gets built
 #
 # Produces, under -OutDir (default `dist`):
 #
@@ -16,21 +18,23 @@
 #     uninstall.ps1                  the reverse
 #   SHA256SUMS.txt                 hashes of every file above, plus the archive
 #
-# Two things the script deliberately checks rather than assumes:
+# Two things the script deliberately checks rather than assumes, and fails on:
 #
 #   * the executable carries its icon and version resource. A build made without
 #     `rc.exe` still compiles and links perfectly well — it just ships a
 #     faceless .exe, which is exactly the defect this milestone exists to fix;
 #   * the executable does not import the VC++ redistributable. That import is
 #     invisible in a build log and only shows up as "the app does not start" on
-#     somebody else's machine.
+#     somebody else's machine. Needs `dumpbin.exe` on PATH — dot-source
+#     `.\toolchain.ps1` first, or it reports that the check was skipped.
 
 [CmdletBinding()]
 param(
     [string]$OutDir = 'dist',
     [string]$Configuration = 'release',
     [switch]$NoBuild,
-    [switch]$NoZip
+    [switch]$NoZip,
+    [switch]$Locked
 )
 
 $ErrorActionPreference = 'Stop'
@@ -62,6 +66,24 @@ function Read-CargoVersion {
         throw 'could not read `version` from Cargo.toml'
     }
     return $Matches[1]
+}
+
+# Deletes through .NET rather than Remove-Item.
+#
+# Remove-Item is not a reliable primitive for this job. Some environments wrap
+# it in a "safe delete" that diverts the target to the Recycle Bin and fails
+# closed when the move fails — which it does for a tree this size — so a second
+# run of this script dies the moment it tries to clear dist\FxMini. A packaging
+# script wants an outright delete anyway: the point is a clean staging directory,
+# not a recoverable one.
+function Remove-Tree {
+    param([string]$Path)
+    if (Test-Path -LiteralPath $Path) { [System.IO.Directory]::Delete($Path, $true) }
+}
+
+function Remove-File {
+    param([string]$Path)
+    if (Test-Path -LiteralPath $Path) { [System.IO.File]::Delete($Path) }
 }
 
 # The signed inf/sys/cat triple is vendored rather than committed: it is a
@@ -203,9 +225,12 @@ $approvedKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Startup
 Remove-ItemProperty -Path $approvedKey -Name 'FxMini' -ErrorAction SilentlyContinue
 
 $shortcut = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\FxMini.lnk'
-if (Test-Path $shortcut) { Remove-Item $shortcut -Force }
+# .NET rather than Remove-Item: an uninstaller wants an outright delete, and
+# Remove-Item can be diverted to the Recycle Bin by a locked-down shell, which
+# would leave the program sitting in place while reporting success.
+if (Test-Path $shortcut) { [System.IO.File]::Delete($shortcut) }
 
-if (Test-Path $target) { Remove-Item $target -Recurse -Force }
+if (Test-Path $target) { [System.IO.Directory]::Delete($target, $true) }
 
 Write-Host ''
 Write-Host 'FxMini removed.'
@@ -341,8 +366,10 @@ try {
 
         # cargo writes progress to stderr; under 'Stop' PowerShell 5.1 turns
         # redirected native stderr into a terminating error.
+        $cargoArgs = @("--$Configuration", '--bin', 'fxmini')
+        if ($Locked) { $cargoArgs += '--locked' }
         $ErrorActionPreference = 'Continue'
-        & cargo build "--$Configuration" --bin fxmini
+        & cargo build @cargoArgs
         $code = $LASTEXITCODE
         $ErrorActionPreference = 'Stop'
         if ($code -ne 0) { throw "cargo build exited $code" }
@@ -364,23 +391,27 @@ Windows SDK, or point FXMINI_RC at an rc.exe, then build again.
     Write-Host ("  size      : {0:N0} bytes" -f (Get-Item $exe).Length)
 
     # A dynamic-CRT build runs fine here and fails on a clean machine, so it is
-    # worth catching at packaging time rather than at the user's.
+    # worth catching at packaging time rather than at the user's. This is a hard
+    # failure rather than a warning on purpose: a warning in a CI log is a
+    # regression that ships anyway.
     $dumpbin = (Get-Command dumpbin.exe -ErrorAction SilentlyContinue).Source
     if ($dumpbin) {
         $deps = & $dumpbin /nologo /dependents $exe
         $redist = $deps | Select-String -Pattern 'VCRUNTIME|MSVCP'
         if ($redist) {
-            Write-Warning @"
+            throw @"
 the executable imports the Visual C++ redistributable:
 $($redist -join "`n")
 It will not start on a machine without it. Check that .cargo\config.toml still
-enables target-feature=+crt-static.
+enables target-feature=+crt-static, and that build.rs is passing /MT to the
+vendored C++.
 "@
         } else {
             Write-Host '  runtime   : self-contained (no VC++ redistributable needed)'
         }
     } else {
-        Write-Host '  runtime   : not checked (dumpbin.exe not on PATH)'
+        Write-Host '  runtime   : NOT CHECKED - dumpbin.exe is not on PATH'
+        Write-Host '              (dot-source .\toolchain.ps1 first; CI does)'
     }
 
     Write-Step 'Locating the driver package'
@@ -396,7 +427,7 @@ binaries\fxvad. Set FXMINI_DRIVER_DIR to override.
 
     Write-Step "Assembling $OutDir\FxMini"
     $stage = Join-Path $here (Join-Path $OutDir 'FxMini')
-    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+    Remove-Tree -Path $stage
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
     Copy-Item $exe (Join-Path $stage 'fxmini.exe') -Force
@@ -413,9 +444,14 @@ binaries\fxvad. Set FXMINI_DRIVER_DIR to override.
     if (-not $NoZip) {
         Write-Step 'Writing the archive'
         $archive = Join-Path $here (Join-Path $OutDir "FxMini-$version-win64.zip")
-        if (Test-Path $archive) { Remove-Item $archive -Force }
+        Remove-File -Path $archive
         # Compress-Archive would nest the folder differently depending on the
         # path shape; going through the parent keeps `FxMini\...` at the root.
+        #
+        # Note for anyone comparing hashes: the *contents* are reproducible —
+        # fxmini.exe hashes identically across runs — but the archive does not,
+        # because zip stores each entry's modification time. Compare the entries
+        # (SHA256SUMS.txt) rather than the zip.
         Push-Location (Split-Path -Parent $stage)
         try {
             Compress-Archive -Path (Split-Path -Leaf $stage) -DestinationPath $archive -CompressionLevel Optimal

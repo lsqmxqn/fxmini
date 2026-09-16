@@ -7,6 +7,9 @@
 /check.log
 /test.log
 
+# ── written by tools/inspect_resources.py (CI uploads it as an artifact) ───
+/icon-check.png
+
 # ── python bytecode (tools/inspect_resources.py) ───────────────────────────
 __pycache__/
 *.pyc

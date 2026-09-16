@@ -9,9 +9,9 @@
 # ---------------------------------------------------------------------------
 # Why this script exists
 #
-# On this machine Visual Studio lives at D:\Program Files\VisualStudio and is
-# NOT registered with the installer, so `vswhere.exe` returns nothing and there
-# is no HKLM\...\VisualStudio\SxS\VS7 entry. Consequences:
+# On the development machine Visual Studio lives at D:\Program Files\VisualStudio
+# and is NOT registered with the installer, so `vswhere.exe` returns nothing and
+# there is no HKLM\...\VisualStudio\SxS\VS7 entry. Consequences:
 #
 #   * cargo cannot find link.exe, so even a hello-world Rust program fails to
 #     build ("linker `link.exe` not found");
@@ -22,11 +22,23 @@
 # first on PATH, rustc invokes it and the build dies with
 # "link: extra operand ... Try 'link --help'". Prepending the MSVC bin
 # directory — which this script does — resolves both problems.
+#
+# On a GitHub runner none of that applies: Visual Studio IS registered there and
+# vswhere finds it. So the toolset root is *resolved* rather than hardcoded, in
+# this order:
+#
+#   1. -MsvcRoot, if given
+#   2. $env:FXMINI_MSVC_ROOT
+#   3. vswhere                                  (what CI relies on)
+#   4. D:\Program Files\VisualStudio\VC\Tools\MSVC   (this machine's layout)
+#
+# The same resolution runs for the Windows SDK, which lives at the standard
+# C:\Program Files (x86)\Windows Kits\10 both here and on a runner.
 # ---------------------------------------------------------------------------
 
 param(
-    [string]$MsvcRoot = 'D:\Program Files\VisualStudio\VC\Tools\MSVC',
-    [string]$SdkRoot  = 'C:\Program Files (x86)\Windows Kits\10',
+    [string]$MsvcRoot = '',
+    [string]$SdkRoot  = '',
     [string]$Arch     = 'x64',
     [string]$HostArch = 'Hostx64'
 )
@@ -39,6 +51,55 @@ param(
 # at the end of this script.
 $fxmini_previous_eap = $ErrorActionPreference
 $ErrorActionPreference = 'Stop'
+
+# This machine's layout, used when nothing better is found. Kept as a constant
+# rather than a parameter default so that "no value was supplied" stays
+# distinguishable from "the caller asked for exactly this path".
+$defaultMsvcRoot = 'D:\Program Files\VisualStudio\VC\Tools\MSVC'
+$defaultSdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
+
+function Resolve-MsvcRoot {
+    param([string]$Explicit)
+
+    if ($Explicit) { return $Explicit }
+    if ($env:FXMINI_MSVC_ROOT) { return $env:FXMINI_MSVC_ROOT }
+
+    # vswhere is how a *registered* Visual Studio is located. It exists on this
+    # machine but reports nothing, because the installation is not registered —
+    # which is the whole reason this script is needed locally. On a runner this
+    # is the branch that does the work.
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        # A probe that is expected to "fail", so relax the preference: under
+        # 'Stop', redirected native stderr becomes a terminating error.
+        $previous = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $install = & $vswhere -latest -products * `
+                -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                -property installationPath 2>$null
+        } finally {
+            $ErrorActionPreference = $previous
+        }
+
+        $install = ($install | Select-Object -First 1)
+        if ($install) {
+            # vswhere ends its output with a newline even for a single property.
+            $root = Join-Path $install.Trim() 'VC\Tools\MSVC'
+            if (Test-Path $root) { return $root }
+        }
+    }
+
+    return $defaultMsvcRoot
+}
+
+function Resolve-SdkRoot {
+    param([string]$Explicit)
+
+    if ($Explicit) { return $Explicit }
+    if ($env:FXMINI_SDK_ROOT) { return $env:FXMINI_SDK_ROOT }
+    return $defaultSdkRoot
+}
 
 function Get-NewestVersionDir {
     param(
@@ -70,6 +131,9 @@ function Get-NewestVersionDir {
 
     return $candidates[0].FullName
 }
+
+$MsvcRoot = Resolve-MsvcRoot -Explicit $MsvcRoot
+$SdkRoot = Resolve-SdkRoot -Explicit $SdkRoot
 
 $toolset = Get-NewestVersionDir -Root $MsvcRoot `
     -RelativeProbe "lib\$Arch" -Label 'MSVC toolset'
@@ -130,8 +194,9 @@ if (-not $clVersion) { throw 'cl.exe produced no version banner — the toolset 
 $linkPath = (Get-Command link.exe -ErrorAction SilentlyContinue).Source
 
 Write-Host 'FxMini toolchain ready'
+Write-Host "  MSVC root    : $MsvcRoot"
 Write-Host "  MSVC toolset : $toolset"
-Write-Host "  Windows SDK  : $sdkVersionName"
+Write-Host "  Windows SDK  : $sdkVersionName  ($SdkRoot)"
 Write-Host "  cl.exe       : $clVersion"
 Write-Host "  link.exe     : $linkPath"
 

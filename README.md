@@ -9,6 +9,7 @@
 托盘常驻的 Windows 音频增强工具。复用 FxSound 开源的 DSP 引擎与虚拟声卡驱动，
 换掉它那套常驻的图形界面：没有主窗口，没有账号，没有联网，空闲内存约 **16 MB**。
 
+[![CI](https://github.com/lsqmxqn/fxmini/actions/workflows/ci.yml/badge.svg)](https://github.com/lsqmxqn/fxmini/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-2b6cb0?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0a7ea4?style=flat-square)](#系统要求)
 [![Rust](https://img.shields.io/badge/rust-2021%20edition-dea584?style=flat-square)](Cargo.toml)
@@ -218,7 +219,44 @@ git clone https://github.com/fxsound2/fxsound-app ../fxsound-app
 .\package.ps1 -NoBuild     # 只重新打包
 ```
 
-产出 `dist/FxMini-<版本>-win64.zip` 与 `dist/SHA256SUMS.txt`。脚本含两项强制自检：exe 必须带图标与版本资源、且不得依赖 VC++ 运行库（后者在构建日志里完全看不见，只会在别人机器上表现为"程序打不开"）。
+产出 `dist/FxMini-<版本>-win64.zip` 与 `dist/SHA256SUMS.txt`。脚本含两项**强制**自检，不通过就失败：
+
+1. exe 必须带图标与版本资源；
+2. exe 不得依赖 VC++ 运行库——这个依赖在构建日志里完全看不见，只会在别人机器上表现为"程序打不开"。
+
+第 2 项需要 `dumpbin.exe`，所以单独跑 `-NoBuild` 前先 `. .\toolchain.ps1`（让脚本自己构建时会自动处理）。
+
+zip 里的**内容**是可复现的（`fxmini.exe` 在多次构建间哈希一致），zip 本身不是——zip 会记录每个条目的时间戳。要对比就比 `SHA256SUMS.txt`，别比 zip。
+
+驱动三件套在 [`driver/`](driver/README.md)（约 343 KB，FxSound 签名版原样分发）：`package.ps1` 需要它，而 CI 没有同级检出可退，所以随仓库提交。
+
+### 用 GitHub Actions 构建
+
+不想配 MSVC 与 Windows SDK 的话交给 CI。推送到 `main` 或提 PR 会跑 [`.github/workflows/ci.yml`](.github/workflows/ci.yml)：
+
+```
+cargo check --all-targets --locked
+cargo test  --lib --locked
+build.ps1 --locked --release --bin fxmini
+tools/inspect_resources.py target/release/fxmini.exe   # 独立复核 PE 资源
+package.ps1 -NoBuild                                   # 两项自检 + 出包
+```
+
+绿色构建会把 `FxMini-<版本>-win64.zip` 作为 artifact 上传，Actions 页面直接可下载——**不发版也能拿到可分发件**。
+
+> 那个 `#[ignore]` 的面板测试在 CI 里**不跑**：它会真的开一个窗口，需要交互式桌面会话。
+
+### 发版
+
+```bash
+# Cargo.toml 里的 version 必须已经是 0.1.0
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) 会打包并创建 Release，附上 zip 与 `SHA256SUMS.txt`。标签与 `Cargo.toml` 版本不一致时工作流**直接失败**：产物的文件名来自版本号，而人们引用的是标签，两者不能漂移。
+
+手动触发（Actions → Release → Run workflow）则只产出 artifact、不创建 Release，用来在不发版的前提下验证整条打包链路。
 
 ---
 
@@ -228,6 +266,12 @@ git clone https://github.com/fxsound2/fxsound-app ../fxsound-app
 cargo check --all-targets      # 零告警是硬要求
 cargo test --lib               # 单元测试（另有 1 个真实开窗的测试默认忽略）
 cargo test --lib -- --ignored  # 跑那个会真的打开一个窗口的面板测试
+```
+
+改了工作流 YAML 之后，推之前先本地过一遍结构检查，免得白等一轮 CI：
+
+```bash
+python tools/check_workflows.py .github/workflows
 ```
 
 三个诊断二进制，按"从离线到真机"的顺序：
@@ -244,15 +288,18 @@ cargo test --lib -- --ignored  # 跑那个会真的打开一个窗口的面板�
 
 ```
 fxmini/
+├── .github/workflows/         CI（校验+构建+打包）与发布（tag → Release）
 ├── build.rs                   编译两个上游静态库；生成并嵌入图标与版本资源
 ├── .cargo/config.toml         静态 CRT：让发布 exe 不依赖 VC++ 运行库
 ├── build.ps1 / toolchain.*    一条命令构建；工具链环境初始化（PowerShell + Bash）
-├── package.ps1                M6 打包：组装 dist/FxMini + zip + SHA256
+├── package.ps1                打包：组装 dist/FxMini + zip + SHA256
 ├── vendor.ps1                 拉取上游源码（幂等，含补丁）
 ├── assets/presets/            17 个内置 .fac，include_bytes! 进二进制
 ├── capi/                      DSP 的 C ABI 封装（上游是 C++ class）
+├── driver/                    虚拟声卡驱动三件套（FxSound 签名版，原样分发）
 ├── tools/
-│   └── inspect_resources.py   校验 exe 里的 RT_ICON / RT_VERSION
+│   ├── inspect_resources.py   校验 exe 里的 RT_ICON / RT_VERSION
+│   └── check_workflows.py     校验工作流 YAML（跑 CI 前先自检）
 ├── vendor/                    上游源码快照（dsp + audiopassthru 的 support 层）
 ├── src/
 │   ├── main.rs                入口：日志、启动参数、单实例、托盘消息循环
@@ -283,8 +330,8 @@ FxMini 是一个 **AI 生成的项目**，请在评估与使用它时把这一�
 | 生成方式 | [WorkBuddy](https://www.workbuddy.cn) 智能体（agentic coding）：由人类给出目标、审阅产出并验收 |
 | 驱动模型 | **DeepSeek-V4.1-Flash** |
 | 生成时间 | 2026 年 9 月 |
-| 生成范围 | `src/`、`build.rs`、`package.ps1`、`vendor.ps1`、`toolchain.*`、`tools/`、`docs/` —— 即除 `vendor/` 之外的全部内容 |
-| 非生成部分 | `vendor/` 逐字复制自上游项目；分发包 `driver/` 中的驱动是 FxSound 的签名二进制，本仓库不含其源码 |
+| 生成范围 | `src/`、`build.rs`、`package.ps1`、`vendor.ps1`、`toolchain.*`、`tools/`、`docs/`、`.github/workflows/` —— 即除 `vendor/` 与 `driver/` 之外的全部内容 |
+| 非生成部分 | `vendor/` 逐字复制自上游项目；`driver/` 中的驱动是 FxSound 的签名二进制，本仓库不含其源码 |
 
 这意味着：
 
@@ -313,7 +360,7 @@ FxMini 是一个 **AI 生成的项目**，请在评估与使用它时把这一�
 ### 第三方与商标
 
 - `vendor/` 下是上游文件的逐字副本（外加 [`patches/README.md`](patches/README.md) 记录的补丁），各自保留原许可；`vendor/LICENSE.fxsound-app` 是上游随源码附带的许可证全文。
-- 分发包 `driver/` 中的虚拟声卡驱动来自 FxSound 的**签名二进制包**，不由本仓库以 AGPL 授权。它们按原样分发，装卸需要管理员权限；再分发涉及的商标与签名问题需自行确认。
+- `driver/` 目录中的虚拟声卡驱动来自 FxSound 的**签名二进制包**，不由本仓库以 AGPL 授权。它们按原样分发（见 [`driver/README.md`](driver/README.md)），装卸需要管理员权限；再分发涉及的商标与签名问题需自行确认。
 - **"FxSound" 名称与图标归其所有者所有。** FxMini 是独立的、与 FxSound 无关联的项目，不是 FxSound 的官方产品。
 
 ---
