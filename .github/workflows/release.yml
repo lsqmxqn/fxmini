@@ -133,15 +133,21 @@ jobs:
 
             **Install**
 
+            The tray menu follows your Windows display language (Chinese or
+            English); switch it any time from the *Language* submenu.
+
             1. Unpack anywhere, run `fxmini.exe`, look for the tray icon.
-            2. Right-click it → *Install virtual sound card*, accept the elevation
+            2. Right-click it → *Install sound card…*, accept the elevation
                prompt. (This step needs administrator rights; until it is done
                there is nothing for the enhancer to sit in front of.)
-            3. Right-click it → *Route output through FxMini*.
+            3. Right-click it → *Route through FxMini*.
+            4. Play something, then right-click → *Tuning panel…* to tune it. When
+               you have a sound you like, use **Save as preset** at the bottom of
+               the panel to keep it.
 
-            `--restore-output` (or the tray menu's *Route output* → *Quit*) hands
-            the system's default output back to a real device. Run it if a crash
-            ever leaves the machine silent.
+            `--restore-output` (or the tray menu's *Quit*) hands the system's
+            default output back to a real device. Run it if a crash ever leaves
+            the machine silent.
 
             **Licence**
 

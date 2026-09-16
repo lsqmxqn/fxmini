@@ -145,7 +145,7 @@ $installScript = @'
 #
 # Installing the virtual sound card DOES require administrator rights, so it is
 # left to the application: right-click the tray icon and choose
-# "Install virtual sound card", then accept the elevation prompt. Until that is
+# "Install sound card...", then accept the elevation prompt. Until that is
 # done FxMini passes audio through unprocessed.
 
 $ErrorActionPreference = 'Stop'
@@ -193,7 +193,7 @@ Start-Process -FilePath $exe
 
 Write-Host ''
 Write-Host 'FxMini is running; look for its icon in the notification area.'
-Write-Host 'Next: right-click that icon -> "Install virtual sound card".'
+Write-Host 'Next: right-click that icon -> "Install sound card...".'
 '@
 
 $uninstallScript = @'
@@ -295,14 +295,14 @@ FxMini - 低占用常驻托盘音效增强  /  a tray-resident audio enhancer
     powershell -ExecutionPolicy Bypass -File install.ps1
 
   脚本会把它复制到 %LOCALAPPDATA%\Programs\FxMini、建一个开始菜单快捷方式，
-  并启动。然后右键托盘图标 -> 「安装虚拟声卡驱动」，同意提权（这一步需要管
+  并启动。然后右键托盘图标 -> 「安装虚拟声卡…」，同意提权（这一步需要管
   理员权限）。装完驱动，声音才会真正经过增强。
 
   The script copies it to %LOCALAPPDATA%\Programs\FxMini, creates a Start-menu
   shortcut and launches it. Then right-click the tray icon and choose
-  "Install virtual sound card", and accept the elevation prompt - that step
-  needs administrator rights, and until it is done there is nothing to route
-  audio through.
+  "Install sound card...", and accept the elevation prompt - that step needs
+  administrator rights, and until it is done there is nothing to route audio
+  through.
 
   运行方式 / How it runs
   ----------------------
@@ -350,9 +350,34 @@ FxMini - 低占用常驻托盘音效增强  /  a tray-resident audio enhancer
   17 个内置预设，首次运行时解包到 %APPDATA%\FxMini\presets。把 .fac 文件丢
   进那个目录，再点托盘的「重新扫描预设」即可使用。
 
+  调音面板（右键托盘 -> 「调音面板…」）最下面一节是「保存为预设」：填个名
+  字点保存，当前的音效、均衡与输出设置就写成一份 .fac 存进同一个目录，并立
+  刻出现在面板列表与托盘菜单里，不必手动「重新扫描预设」。重名会覆盖。名称
+  里不能含 \ / : * ? " < > | 或 CON、NUL、COM1 这类保留名，面板会当场拦下。
+
   Seventeen presets ship inside the executable and are unpacked to
   %APPDATA%\FxMini\presets on first run. Drop .fac files there and hit "Rescan
   presets" to add your own.
+
+  The tuning panel (tray -> "Tuning panel...") ends with a "Save as preset"
+  section: type a name, hit Save, and the current effects, equalizer and output
+  settings are written as a .fac into that same folder, appearing immediately in
+  the panel list and the tray menu without a manual rescan. An existing name is
+  overwritten. A name may not contain \ / : * ? " < > | or a reserved device
+  name such as CON, NUL or COM1 - the panel refuses those outright.
+
+  语言 / Language
+  ---------------
+  托盘菜单与调音面板都支持中文与 English，默认跟随 Windows 显示语言。想改就
+  在托盘菜单的「语言」里点一下（两项分别写作「中文」和「English」）；选过之
+  后会记住，不再跟随系统。想恢复跟随系统，把 %APPDATA%\FxMini\config.json
+  里的 "language" 改成 "auto"。
+
+  The tray menu and the tuning panel both come in Chinese and English, following
+  your Windows display language by default. Change it from the tray menu's
+  "Language" submenu (the two entries read "中文" and "English"); your choice is
+  remembered and stops following the system. To go back to following the system,
+  set "language" to "auto" in %APPDATA%\FxMini\config.json.
 
   关于本项目 / About this project
   ------------------------------
