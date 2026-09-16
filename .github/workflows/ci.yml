@@ -76,6 +76,10 @@ jobs:
           . ./toolchain.ps1
           cargo test --lib --locked
 
+      # `--locked` is right *here* and only here: build.ps1 forwards its arguments
+      # verbatim to cargo, and this is cargo's flag. package.ps1, by contrast, is
+      # a PowerShell script whose switch is -Locked (single dash) — see the guard
+      # in package.ps1 for what `.\package.ps1 --locked` actually does.
       - name: Build release executable
         shell: pwsh
         run: ./build.ps1 --locked --release --bin fxmini
@@ -106,9 +110,19 @@ jobs:
           . ./toolchain.ps1
           ./package.ps1 -NoBuild
 
+      # Guarded on purpose: an unguarded `Get-Content dist/SHA256SUMS.txt` fails
+      # *after* packaging but *before* the upload, so a cosmetic line can cost you
+      # the artifact. A red job should mean the build is broken.
       - name: Show what was produced
         shell: pwsh
-        run: Get-Content dist/SHA256SUMS.txt
+        run: |
+          if (Test-Path 'dist/SHA256SUMS.txt') {
+            Get-Content 'dist/SHA256SUMS.txt'
+          } else {
+            Write-Host 'dist/SHA256SUMS.txt is missing'
+            Get-ChildItem . -Recurse -Filter '*.zip' -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host $_.FullName }
+          }
 
       - name: Upload the zip
         uses: actions/upload-artifact@v4

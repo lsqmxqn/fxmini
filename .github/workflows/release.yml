@@ -82,18 +82,30 @@ jobs:
       # VC++ redistributable import, then assembles and zips. It also locates the
       # driver in driver/, which is why the three signed files are committed to
       # this repository: a runner has no sibling checkout to fall back to.
+      #
+      # -Locked is a *PowerShell* switch (single dash) that forwards `--locked` to
+      # cargo. Writing `--locked` here binds it to -OutDir instead, which builds
+      # happily and writes the whole package into a directory named `--locked`.
       - name: Package
         shell: pwsh
-        run: ./package.ps1 --locked
+        run: ./package.ps1 -Locked
 
-      - name: Show what was produced
+      # Cosmetic, and written so that it cannot fail: a red job should mean the
+      # release is broken, not that a log summary was.
+      - name: List what was produced
         shell: pwsh
         run: |
-          Get-ChildItem dist -Recurse -File | ForEach-Object {
-            '{0,12:N0}  {1}' -f $_.Length, $_.FullName
+          if (-not (Test-Path dist)) { Write-Host 'dist/ was not created'; exit 0 }
+          $root = (Get-Location).Path.Length + 1
+          Get-ChildItem dist -Recurse -File | Sort-Object FullName | ForEach-Object {
+            '{0,12:N0}  {1}' -f $_.Length, $_.FullName.Substring($root)
           }
-          ''
-          Get-Content dist/SHA256SUMS.txt
+          if (Test-Path 'dist/SHA256SUMS.txt') {
+            Write-Host ''
+            Get-Content 'dist/SHA256SUMS.txt'
+          } else {
+            Write-Host 'SHA256SUMS.txt is missing'
+          }
 
       - name: Upload the zip
         uses: actions/upload-artifact@v4

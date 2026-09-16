@@ -39,6 +39,20 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# `.\package.ps1 --locked` binds the *out directory* to the string "--locked".
+#
+# PowerShell switches are single-dash, so `--locked` is not a parameter name at
+# all — it falls through to the first positional parameter, which is -OutDir.
+# The build then succeeds and the entire distributable lands in a directory
+# literally named `--locked`, with exit code 0. That is a genuinely confusing way
+# to spend an afternoon, and it happened once in CI. Catch it at the door.
+if ($OutDir -match '^-') {
+    throw @"
+-OutDir was given the value '$OutDir', which looks like a mistyped switch.
+PowerShell switches take a single dash: write -Locked, not --locked.
+"@
+}
+
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $version = $null
 $stage = $null
