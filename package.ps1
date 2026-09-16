@@ -354,6 +354,19 @@ FxMini - 低占用常驻托盘音效增强  /  a tray-resident audio enhancer
   %APPDATA%\FxMini\presets on first run. Drop .fac files there and hit "Rescan
   presets" to add your own.
 
+  关于本项目 / About this project
+  ------------------------------
+  这是一件 AI 生成的作品：由 WorkBuddy 智能体驱动，底层模型为
+  DeepSeek-V4.1-Flash，生成于 2026-09。除 driver\ 下逐字复制、由 FxSound
+  签名的虚拟声卡驱动与 vendor\ 下逐字复制的上游源码之外，本程序其余代码与
+  文档均出自该模型。认为其中某处不对，先假设它写错了再查。
+
+  This is an AI-generated work: produced through the WorkBuddy agent, driven by
+  the DeepSeek-V4.1-Flash model, in 2026-09. Apart from the verbatim, FxSound-
+  signed driver under driver\ and the verbatim upstream sources under vendor\,
+  all of the code and prose here was written by that model. Assume any given line
+  is wrong until you have checked it.
+
   许可 / Licence
   --------------
   AGPL-3.0-or-later，见 LICENSE.txt。驱动来自 FxSound，版权归其所有。
