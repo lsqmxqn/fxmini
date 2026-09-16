@@ -1,311 +1,330 @@
+<div align="center">
+
+<img src="docs/icon-preview.png" width="112" alt="FxMini">
+
 # FxMini
 
-托盘常驻的 Windows 音频增强工具。复用 FxSound 的虚拟声卡驱动与 DSP 引擎，不带 FxSound 的 App 界面，内存占用目标 **< 20 MB**。
+**只有 FxSound 的声音，没有 FxSound 的 App。**
 
-> 详细技术方案见 [`docs/设计方案.md`](docs/设计方案.md)。
+托盘常驻的 Windows 音频增强工具。复用 FxSound 开源的 DSP 引擎与虚拟声卡驱动，
+换掉它那套常驻的图形界面：没有主窗口，没有账号，没有联网，空闲内存约 **16 MB**。
+
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-2b6cb0?style=flat-square)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0a7ea4?style=flat-square)](#系统要求)
+[![Rust](https://img.shields.io/badge/rust-2021%20edition-dea584?style=flat-square)](Cargo.toml)
+[![AI](https://img.shields.io/badge/AI-DeepSeek--V4.1--Flash-6b46c1?style=flat-square)](#ai-生成声明)
+[![Built with WorkBuddy](https://img.shields.io/badge/built%20with-WorkBuddy-16a34a?style=flat-square)](https://www.workbuddy.cn)
+
+</div>
+
+---
+
+## 这是什么
+
+FxSound 的效果很好，但它的官方 App 是一个常驻的图形程序：内存占用三位数（MB）、带账号与联网、要一直开着主界面。如果你只想"让系统的声音变好听一点"，这些都不需要。
+
+FxMini 把 FxSound 的两样东西留下来——**DSP 引擎**和**虚拟声卡驱动**——其余的换成一个小托盘程序：
+
+- 系统里所有应用的声音都过增强，不只是某一个播放器（靠接管系统默认输出设备实现）；
+- 需要调音时点托盘弹出一个面板，关掉就释放；
+- 平时是一个图标，占用可以忽略。
+
+因为 DSP 用的是上游**同一份源码**，声音与 FxSound 是**逐位一致**的，`.fac` 预设生态可以直接用。
 
 仓库：<https://github.com/lsqmxqn/fxmini>
 
-### 关联的上游项目
-
-FxMini 是 FxSound 开源实现的**再包装**，不重复造轮子。两处依赖都在上游的公开仓库里，`vendor/` 中的源码即取自它们：
-
-| 项目 | 用到的部分 | 许可 |
-|---|---|---|
-| [`fxsound2/fxsound-app`](https://github.com/fxsound2/fxsound-app) | DSP 引擎（`dsp/`）+ 辅助层（`audiopassthru/` 的 support 部分） | AGPL-3.0 |
-| [`fxsound2/fxsound-driver`](https://github.com/fxsound2/fxsound-driver) | 虚拟声卡驱动 `fxvad`（签名二进制，装/卸与分发时才需要） | AGPL-3.0 |
-
-FxMini 自己写的只有胶水：虚拟声卡的安装卸载、WASAPI 回环链路、托盘、小面板。
+> 想了解实现细节：架构与选型见 [`docs/设计方案.md`](docs/设计方案.md)，踩坑与验证数据见 [`docs/开发笔记.md`](docs/开发笔记.md)。
 
 ---
 
-## 为什么是"复用 DSP"而不是"重写"
+## 特性
 
-`fxsound2/fxsound-app` 以 AGPL-3.0 开源了**完整的 DSP 引擎源码**（`dsp/`，约 9000 行 C++）。它的公开 API 只有 79 行、约 30 个方法，干净到可以当库用。
-
-这带来两个结果：
-
-- 不需要逆向或逼近 FxSound 的音效算法
-- 声音和 FxSound 官方**逐位一致**，`.fac` 预设生态直接用
-
-需要自己写的只有胶水：虚拟声卡的安装卸载、WASAPI 回环链路、托盘、小面板。
-
----
-
-## 前置条件
-
-本机的 MSVC 与 Windows SDK 已经装好了，但**需要显式初始化环境**才能用：
-
-| 组件 | 位置 |
+| | |
 |---|---|
-| MSVC 工具集 | `D:\Program Files\VisualStudio\VC\Tools\MSVC\14.42.34433` |
-| Windows SDK | `C:\Program Files (x86)\Windows Kits\10`（10.0.26100.0） |
-| Rust | 1.94.1，host `x86_64-pc-windows-msvc` |
+| **全系统生效** | 接管系统默认输出设备，所有应用的声音都经过增强，而不是只处理某一个播放器 |
+| **音质与 FxSound 一致** | 直接用上游 DSP 源码编译，不是近似实现；`.fac` 预设可直接使用 |
+| **占用小** | 空闲内存约 **16 MB**，空闲 CPU 约 **1.25%**；目标是最低限度的常驻 |
+| **无主窗口** | 平时只有托盘图标；调音面板按需弹出，关闭后立即释放 GL 上下文与字体图集 |
+| **31 段均衡器 + 5 个音效槽** | Fidelity / Surround / Ambience / DynamicBoost / Bass，带实时频谱显示 |
+| **17 个内置预设** | Rock、Jazz、Movie、Gaming 等；自定义 `.fac` 丢进用户目录即可出现在菜单里 |
+| **不会把你留在静音状态** | 崩溃或被强杀后，下次启动自动把默认输出交还给真实声卡；卸载脚本也这么做 |
+| **开机自启（默认开）** | 默认开启，而且不是便利功能——见下面的说明 |
+| **免安装、单文件** | 静态 CRT，不依赖 VC++ 运行库；打包成便携 zip，解压即用 |
 
-**为什么需要额外脚本**：这台机器的 Visual Studio 装在 `D:\Program Files\VisualStudio` 且没有向安装器注册，`vswhere.exe` 查不到、注册表里也没有条目。后果有两个：
+### 关于开机自启
 
-1. `cargo` 找不到 `link.exe`，连 hello world 都链不出来
-2. `cc` crate 找不到 `cl.exe`，DSP 根本编不了
+FxMini 必须**接管系统默认输出设备**，增强才会在音频链路里：
 
-还有第二个更阴的坑：**Git for Windows 在 `/usr/bin` 里带了一个同名的 `link.exe`**，它是 coreutils 的硬链接工具，不是链接器。PATH 顺序不对时 rustc 会调到它，报出莫名其妙的 `link: extra operand ... Try 'link --help'`。
+```
+默认输出 = 虚拟声卡 ──> FxMini 回环采集 ──> DSP 增强 ──> 物理声卡
+```
 
-两个问题都由 `toolchain.ps1` / `toolchain.sh` 解决——它们会自动挑选**真正完整**的工具集版本（本机 `14.50.35717` 有头文件但没有 `lib\x64`，必须跳过），然后把 MSVC 的 bin 目录前置到 PATH。
+虚拟声卡是个死胡同，没有人从它取数据就是彻底的静音。所以一旦 FxMini 持有默认输出，**登录时它没起来就等于这台机器没有声音**。自启因此默认开启，启动时会把「期望状态」与注册表对账：
+
+- 没有启动项 → 写入；
+- 启动项指向**另一个位置**的 exe（换过目录、或开发时跑 `target/`）→ 重写，否则开机启动的是一个不存在的路径，而且悄无声息；
+- 你在**任务管理器 → 启动**里手动关掉了 → **原样保留，不抢**，托盘里的勾选状态也会如实反映。
+
+---
+
+## 工作原理
+
+```
+任意播放器 / 系统声音
+        │
+        ▼
+ ┌──────────────────┐
+ │  FxMini 虚拟声卡  │   ← 系统默认输出被指向这里
+ └──────────────────┘
+        │  WASAPI 回环采集
+        ▼
+ ┌──────────────────┐
+ │   FxSound DSP    │   31 段 EQ + 5 个音效槽
+ └──────────────────┘
+        │
+        ▼
+   真实声卡 → 扬声器 / 耳机
+```
+
+FxMini 自己写的是中间那段胶水：虚拟声卡的安装卸载、WASAPI 回环链路、托盘、面板，以及最关键的——**默认设备的接管与归还**。DSP 与驱动来自上游。
+
+---
+
+## 系统要求
+
+- **Windows 10 / 11，x64**
+- 安装虚拟声卡驱动时需要**管理员权限**（驱动是 FxSound 的签名包，由 Windows 校验）
+- 使用预编译包不需要任何运行时依赖
+- **从源码构建**另外需要 MSVC 工具集 + Windows SDK + Rust；仓库里的脚本会自动定位它们，见[从源码构建](#从源码构建)
+
+---
+
+## 安装
+
+预编译包是 `FxMini-<版本>-win64.zip`，解压后是一个 `FxMini\` 目录：
+
+```
+FxMini\
+  fxmini.exe               主程序
+  driver\                  虚拟声卡驱动（fxvad.inf / .sys / .ntamd64.cat）
+  README.txt               说明
+  LICENSE.txt              许可
+  install.ps1              单用户安装：复制到 %LOCALAPPDATA%、建快捷方式、启动
+  uninstall.ps1            反向操作，含归还默认输出
+```
+
+**首次使用**：
+
+1. 解压到任意目录（例如 `%LOCALAPPDATA%\Programs\FxMini`），双击 `fxmini.exe`，托盘出现图标；
+2. 右键托盘 → **安装虚拟声卡驱动…**，在 UAC 弹窗里允许；
+3. 右键托盘 → **输出走 FxMini 增强**；
+4. 播放一段音乐，右键托盘 → **调音面板…** 调整音效；或从 **预设** 子菜单里挑一个。
+
+想装到 `%LOCALAPPDATA%\Programs\FxMini` 并创建开始菜单快捷方式，用管理员 PowerShell 跑一次 `install.ps1` 即可（它**不**安装驱动，驱动始终在第 2 步由你确认）。
+
+**卸载**：跑 `uninstall.ps1`，或手动删除目录。卸载脚本会先把默认输出交还给真实声卡——否则你会留下一台没有声音的机器。
+
+---
+
+## 使用
+
+### 托盘菜单
+
+| 菜单项 | 说明 |
+|---|---|
+| 启用音效 | 总开关，关掉即旁通 DSP |
+| 输出走 FxMini 增强 | 把系统默认输出指向虚拟声卡。**已经生效时这一项会置灰**，所以"右键看看它灰没灰"就是"音频到底走了增强没有"的答案 |
+| 调音面板… | 打开调音窗口（已打开时再次点击会聚焦到现有窗口） |
+| 预设 ▸ | 切换 `.fac` 预设，当前生效的一项带勾 |
+| 开机自启 | 见上文说明 |
+| 安装 / 卸载虚拟声卡驱动… | 会触发 UAC；不适用的那一项自动置灰 |
+| 重新扫描预设 | 重新读取用户预设目录 |
+| 退出 | 归还默认输出后退出 |
+
+### 命令行
+
+| 参数 | 用途 |
+|---|---|
+| `--panel` | 启动时直接打开调音面板 |
+| `--restore-output` | 把默认输出交还给真实声卡后退出。**"突然没声音"时的救命命令** |
+| `--install-driver` | 安装虚拟声卡驱动（须以管理员身份运行，由主程序通过 UAC 自行调用，一般不用手敲） |
+| `--remove-driver` | 卸载虚拟声卡驱动（同上） |
+
+### 数据与配置
+
+全部在 `%APPDATA%\FxMini\` 下：
+
+```
+config.json     设置（是否启用、当前预设、开机自启、崩溃恢复标记）
+presets\        内置预设会解包到这里；把你自己的 .fac 丢进来即可被识别
+fxmini.log      运行日志，排查问题先看它
+```
+
+---
+
+## 疑难排解
+
+**突然没有声音了**
+FxMini 退出时会把默认输出交还给真实声卡；如果是被强杀或崩溃，勾选状态可能停在虚拟声卡上。跑一次 `fxmini.exe --restore-output` 即可。正常退出后再次运行 FxMini 也会自动修复。
+
+**播放器/系统里多了一个 FxMini 设备**
+这是正常的——虚拟声卡就是以这个身份出现在系统里的。不需要手动改默认设备，托盘菜单的"输出走 FxMini 增强"会处理。
+
+**开机后没有声音**
+先确认 FxMini 有没有启动（托盘有没有图标）。如果没有，检查**任务管理器 → 启动**里 FxMini 是否被禁用；被禁用时 FxMini 不会强行打开它，只会如实显示。
+
+**自己编译的 exe 没有图标**
+`build.rs` 在编译期调用 `rc.exe` 把图标与版本资源写进 exe。找不到 `rc.exe` 时构建仍然成功，只是产出一个没有图标的 exe（会给出警告）。安装 Windows SDK，或用 `FXMINI_RC` 环境变量指向 `rc.exe` 的绝对路径。
+
+**系统里还有一个 FxSound 的虚拟设备**
+如果之前装过官方 FxSound，可能同时存在两个虚拟声卡。建议先卸载官方的那个，避免选错设备。
+
+---
+
+## 从源码构建
 
 ```powershell
-# PowerShell（推荐：一条命令，自动处理工具链与 cargo 的 PATH）
+# 一条命令：初始化工具链 + 构建（推荐）
 .\build.ps1
+.\build.ps1 --release --bin fxmini
 
-# 等价的手工两步
+# 等价的 PowerShell 手工两步
 . .\toolchain.ps1
-cargo build --release --bin dspcheck
+cargo build --release --bin fxmini
 ```
 
 ```bash
 # Git Bash / MSYS
 source toolchain.sh
-cargo build --release --bin dspcheck
+cargo build --release --bin fxmini
 ```
 
-**前置条件只此一步。** 两个静态库所需的宏定义已经写进 `build.rs`，与上游两个 `.vcxproj` 严格一致，不需要手工设置。
+> **为什么需要 `toolchain.ps1`**：本机的 Visual Studio 装在非默认路径且未向安装器注册，`cargo` 找不到 `link.exe`、`cc` 找不到 `cl.exe`。脚本负责定位真正完整的工具集并把它的 bin 前置到 PATH。细节与另外几个构建陷阱见 [`docs/开发笔记.md`](docs/开发笔记.md) 第 2 节。
 
----
-
-## 快速开始
-
-```bash
-# 1. 初始化工具链（必须先做，见上一节）
-source toolchain.sh                  # 或 PowerShell: . .\toolchain.ps1
-
-# 2. 跑 M1 冒烟测试
-cargo run --release --bin dspcheck
-
-# 指定预设（用仓库自带的）
-cargo run --release --bin dspcheck -- assets/presets/Gaming.fac
-```
-
-`vendor/` 里那 127 个上游单元（DSP 94 + 辅助层 33）**已经随仓库提交**，clone 下来直接就能编，不需要先准备 `fxsound-app`。只有打算跟上游同步时才需要重新 vendor：
+`vendor/` 下的 127 个上游单元（DSP 94 + 辅助层 33）**已经随仓库提交**，clone 下来直接就能编，不需要先准备 `fxsound-app`。只有打算跟上游同步时才需要重新 vendor：
 
 ```bash
 git clone https://github.com/fxsound2/fxsound-app ../fxsound-app
 ```
 
 ```powershell
-.\vendor.ps1 -Source ..\fxsound-app -Dest .     # 幂等：只覆盖不删除，含上游补丁
+.\vendor.ps1 -Source ..\fxsound-app -Dest .   # 幂等：只覆盖不删除，含上游补丁
 ```
 
-`dspcheck` 不涉及驱动和 WASAPI，纯离线跑一段 1 kHz 正弦。它断言三件事：
-
-1. 真实 `.fac` 能被解析并填充 EQ 与音效状态
-2. `set_power(true)` 能读回 on（上游 getter 是反的，这里能验证封装没退化）
-3. 引擎确实改变了信号（说明处理真的生效了）
-
-输出会打印 31 段 EQ 的频率/增益、五个音效槽在两种值域下的读数、以及处理前后的 RMS 变化。**如果它报 FAIL，后面全白搭**——所以这一步必须最先做。
-
-实测输出（`Music.fac`）：
-
-```
-engine created, 5 effect slots reported
-preset name      : 音乐
-power            : true  (round-trip of set_power(true))
-EQ bands         : 31
-effects
-                  get 0-1   set 0-10  fac Main
-  Fidelity          0.394       3.94        50
-  Bass              0.472       4.72        60
-signal check (1 kHz sine at -6 dBFS)
-  RMS in        : 0.353553
-  RMS out       : 0.588367
-  change        : +4.42 dB
-OK: engine compiled, parsed a real preset, and altered the signal
-```
-
----
-
-## 运行
+### 打包
 
 ```powershell
-.\build.ps1 --release --bin fxmini
-.\target\release\fxmini.exe            # 托盘图标出现
-.\target\release\fxmini.exe --panel    # 顺带直接打开调音面板
-```
-
-托盘右键菜单：启用音效 / 输出走 FxMini 增强 / 调音面板 / 预设 / 开机自启 / 安装与卸载虚拟声卡驱动 / 退出。
-
-### 开机自启默认开启，而且不是可选项
-
-FxMini 必须**接管系统默认输出设备**，增强才会在链路里：
-
-```
-默认输出 = 虚拟声卡 → 回环采集 → DSP → 物理声卡
-```
-
-虚拟声卡是死胡同，没人从它取数据就是彻底的静音。所以一旦 FxMini 持有默认输出，登录时它没起来 = 这台机器没有声音。自启因此默认开启（`config.rs` 的 `autostart: true`），启动时由 [`src/autostart.rs`](src/autostart.rs) 把「期望状态」与注册表对账：
-
-- `HKCU\...\Run` 里没有条目 → 写入；
-- 条目指向**另一个位置**的 exe（换目录、开发时跑 `target/`）→ 重写，否则开机启动的是一个已不存在的路径，而且悄无声息；
-- 用户在**任务管理器 → 启动**里关掉了（状态存在 `Explorer\StartupApproved\Run`，Windows 会因此不启动它，尽管条目还在）→ **原样保留，不抢**；`is_enabled()` 会把这个状态算进去，所以托盘勾选不会撒谎；
-- 从托盘再打开时会一并清掉任务管理器的禁用标记，否则"重新勾上"根本不会生效。
-
-### 没有声音时
-
-```powershell
-.\target\release\fxmini.exe --restore-output
-```
-
-把默认输出切回真实声卡后退出。正常退出会自己归还，异常退出会在下次启动时自动修复，所以这条命令基本用不上——它主要给卸载脚本用：托盘程序没有 IPC，卸载只能强杀，而强杀会跳过归还路径。
-
----
-
-## 打包（M6）
-
-```powershell
-.\package.ps1              # 构建 + 组装 + 压缩
+.\package.ps1              # 构建 + 组装 dist/FxMini + 压缩
 .\package.ps1 -NoBuild     # 只重新打包
 ```
 
-产出 `dist/FxMini-<version>-win64.zip`，内容是：
-
-```
-FxMini\
-  fxmini.exe                   主程序（含图标与版本资源）
-  driver\fxvad.inf             虚拟声卡驱动三件套（FxSound 签名版，原样分发）
-  driver\fxvad.sys
-  driver\fxvadntamd64.cat
-  README.txt                   双语说明
-  LICENSE.txt                  AGPL-3.0-or-later + 商标说明
-  install.ps1                  单用户安装：复制、建快捷方式、启动
-  uninstall.ps1                反向操作，包含归还默认输出
-SHA256SUMS.txt
-```
-
-两件在打包时**强制检查**而不是假设的事：
-
-1. **exe 里有图标和版本资源**。没有 `rc.exe` 时构建照样成功，只是产出一个没脸的 exe —— 正是这一次要修的缺陷。脚本读不到 `ProductName`/`FileVersion` 就直接失败；`tools/inspect_resources.py` 可以进一步 dump 出 `RT_ICON`/`RT_GROUP_ICON`/`RT_VERSION` 并把图标存成 PNG 看。
-2. **exe 不导入 VC++ 运行库**。`.cargo/config.toml` 打开 `target-feature=+crt-static`，`build.rs` 检测同一个设置并让 vendored C++ 用 `/MT`（MSVC 不支持一个进程里混两种 CRT）。检查方式是 `dumpbin /dependents` 里不能出现 `VCRUNTIME140`/`MSVCP140`。这个依赖在构建日志里完全看不见，只会在别人机器上表现为"程序打不开"。
-
-驱动**不**内嵌进 exe，而是留在旁边的 `driver\` 目录：它是带自己许可证的签名二进制，让它在磁盘上保持可见比塞进我们的可执行文件更合适。`driver.rs` 本来就按「exe 同目录 → `driver\` → `resources\fxvad\`」的顺序找它。
-
-图标由 `build.rs` 在编译期用 Rust 画出来（16/24/32/48/64/128/256 七个尺寸打包成 `.ico`），绘图代码与托盘图标**是同一份**（`src/ui/icon_raster.rs`，被 `build.rs` `include!`）——两份实现迟早会画得不一样，而这件事只有在用户桌面上才看得见。
+产出 `dist/FxMini-<版本>-win64.zip` 与 `dist/SHA256SUMS.txt`。脚本含两项强制自检：exe 必须带图标与版本资源、且不得依赖 VC++ 运行库（后者在构建日志里完全看不见，只会在别人机器上表现为"程序打不开"）。
 
 ---
 
-## 目录结构
+## 开发与测试
+
+```bash
+cargo check --all-targets      # 零告警是硬要求
+cargo test --lib               # 单元测试（另有 1 个真实开窗的测试默认忽略）
+cargo test --lib -- --ignored  # 跑那个会真的打开一个窗口的面板测试
+```
+
+三个诊断二进制，按"从离线到真机"的顺序：
+
+| 命令 | 作用 |
+|---|---|
+| `cargo run --release --bin dspcheck` | 纯离线跑一段 1 kHz 正弦，验证 DSP 能编译、能解析真实 `.fac`、且确实改变了信号。**不涉及驱动与 WASAPI，报 FAIL 后面全白搭** |
+| `cargo run --release --bin audiochk -- --seconds 5` | 跑真实回环链路，报告丢帧、削波与峰值 |
+| `cargo run --release --bin audioenv` | 打印音频环境诊断；`--route-test 5` 实测默认设备切换与归还，`--restore-output` 手工撤销一次接管 |
+
+---
+
+## 项目结构
 
 ```
 fxmini/
-├── .cargo/config.toml             静态 CRT：让发布 exe 不依赖 VC++ 运行库
-├── .gitattributes                 行尾归一化；.fac 与驱动二进制不做文本处理
-├── .gitignore                     忽略 target/、dist/、构建日志与 vendor 的遗留目录
-├── Cargo.toml
-├── LICENSE                        AGPL-3.0 全文
-├── build.rs                       编译 dfxdsp + dfxutil 两个静态库；生成并嵌入图标与版本资源
-├── build.ps1                      一条命令：工具链 + cargo
-├── package.ps1                    M6 打包：组装 dist/FxMini + zip + SHA256
-├── toolchain.ps1                  PowerShell 环境初始化（自动定位工具集）
-├── toolchain.sh                   Git Bash 等价版本
-├── vendor.ps1                     vendor 脚本（幂等，默认只覆盖不删除，含上游补丁）
-├── patches/README.md              vendor 时打在源码上的上游缺陷修复记录
-├── assets/presets/                17 个内置 .fac，include_bytes! 进二进制
-├── capi/
-│   ├── dfxdsp_capi.h              C ABI 声明
-│   └── dfxdsp_capi.cpp            包装 C++ class DfxDsp
+├── build.rs                   编译两个上游静态库；生成并嵌入图标与版本资源
+├── .cargo/config.toml         静态 CRT：让发布 exe 不依赖 VC++ 运行库
+├── build.ps1 / toolchain.*    一条命令构建；工具链环境初始化（PowerShell + Bash）
+├── package.ps1                M6 打包：组装 dist/FxMini + zip + SHA256
+├── vendor.ps1                 拉取上游源码（幂等，含补丁）
+├── assets/presets/            17 个内置 .fac，include_bytes! 进二进制
+├── capi/                      DSP 的 C ABI 封装（上游是 C++ class）
 ├── tools/
-│   └── inspect_resources.py       校验 exe 里的 RT_ICON / RT_VERSION（M6 自检）
-├── vendor/
-│   ├── dsp/                       上游 DSP 源码树（94 单元 + 196 头文件）
-│   ├── sources-dsp.txt            94 个单元清单，从 DfxDsp.vcxproj 导出
-│   ├── audiopassthru/             上游辅助层（33 单元 + include/）
-│   ├── sources-audiopassthru.txt  33 个单元清单，从 audiopassthru.vcxproj 导出
-│   └── LICENSE.fxsound-app        AGPL-3.0
+│   └── inspect_resources.py   校验 exe 里的 RT_ICON / RT_VERSION
+├── vendor/                    上游源码快照（dsp + audiopassthru 的 support 层）
 ├── src/
-│   ├── main.rs                    日志、单实例互斥、启动参数、托盘消息循环
-│   ├── lib.rs
-│   ├── app.rs                     托盘 / 引擎 / 配置之间的接线
-│   ├── autostart.rs               HKCU\...\Run 对账：期望状态 ↔ 注册表实际状态
-│   ├── config.rs                  设置持久化与 %APPDATA%\FxMini 路径
-│   ├── device.rs                  端点枚举、默认设备切换、IMMNotificationClient 热插拔
-│   ├── routing.rs                 接管/归还系统默认输出（音频真正生效的前提）
-│   ├── driver.rs                  虚拟声卡检测 / 安装 / 卸载
-│   ├── engine.rs                  音频线程：回环采集 → DSP → 渲染
-│   ├── preset.rs                  .fac 解析、内置预设、用户预设目录
-│   ├── ffi.rs                     C ABI 的 Rust 绑定 + RAII 封装 Dsp
-│   ├── ui/
-│   │   ├── icon_raster.rs         图标绘制（托盘与 exe 图标共用同一份代码）
-│   │   ├── icon.rs                包成 tray_icon::Icon
-│   │   ├── tray.rs                托盘菜单
-│   │   └── panel.rs               调音小面板（egui，常驻线程 + 通道唤醒）
-│   └── bin/
-│       ├── dspcheck.rs            M1 冒烟测试（离线 DSP）
-│       ├── audiochk.rs            M2 冒烟测试（真实回环链路）
-│       └── audioenv.rs            音频环境诊断 + --route-test / --restore-output
-└── docs/设计方案.md               完整技术方案
+│   ├── main.rs                入口：日志、启动参数、单实例、托盘消息循环
+│   ├── app.rs                 托盘 / 引擎 / 配置之间的接线
+│   ├── engine.rs              音频线程：回环采集 → DSP → 渲染
+│   ├── routing.rs             接管与归还系统默认输出
+│   ├── device.rs              端点枚举、默认设备切换、热插拔通知
+│   ├── driver.rs              虚拟声卡检测 / 安装 / 卸载
+│   ├── preset.rs              .fac 解析、内置预设、用户预设目录
+│   ├── autostart.rs           开机自启与注册表对账
+│   ├── config.rs              设置持久化（%APPDATA%\FxMini）
+│   ├── ffi.rs                 C ABI 的 Rust 绑定 + RAII 封装
+│   ├── ui/                    托盘、调音面板、图标绘制
+│   └── bin/                   dspcheck / audiochk / audioenv 三个诊断工具
+└── docs/                      设计方案、开发笔记
 ```
 
 `vendor/` 下**不包含**上游的设备层（`audiopassthru/src/AudioPassthru`、`src/sndDevices`）——FxMini 自己实现音频环，那部分是死代码。
 
 ---
 
-## 上游的坑（都已在 `capi` / `build.rs` 里抹平）
+## AI 生成声明
 
-**API 层面**
+FxMini 是一个 **AI 生成的项目**，请在评估与使用它时把这一点考虑进去。
 
-1. **返回码是反的**：上游 `#define OKAY 0`（`codedefs.h:95`），而且 `NOT_OKAY` 在 debug 构建里展开成一个函数调用。C ABI 统一成 `DFXDSP_OK = 0` / `DFXDSP_ERR = -1`。
-2. **样本类型名不符实**：签名写 `short int *`，实际永远是 32 位浮点（`DfxDspPrivate.cpp:184`）。C ABI 直接暴露 `float*`。
-3. **`isPowerOn()` 是反的**：它读 BYPASS 键，非零返回 true，即**被旁通时报"开"**（`DfxDspPrivate.cpp:216`）。而 `powerOn(true)` 把 BYPASS 设为 0，所以 getter 和 setter 自相矛盾。C ABI 已反转修正，`dspcheck` 里有回归检查。
-4. **音效 getter/setter 值域不对称**（上游设计，非笔误）：
+| | |
+|---|---|
+| 生成方式 | [WorkBuddy](https://www.workbuddy.cn) 智能体（agentic coding）：由人类给出目标、审阅产出并验收 |
+| 驱动模型 | **DeepSeek-V4.1-Flash** |
+| 生成时间 | 2026 年 9 月 |
+| 生成范围 | `src/`、`build.rs`、`package.ps1`、`vendor.ps1`、`toolchain.*`、`tools/`、`docs/` —— 即除 `vendor/` 之外的全部内容 |
+| 非生成部分 | `vendor/` 逐字复制自上游项目；分发包 `driver/` 中的驱动是 FxSound 的签名二进制，本仓库不含其源码 |
 
-   | | 值域 | 内部 |
-   |---|---|---|
-   | `getEffectValue()` | **0.0 – 1.0** | 归一化 |
-   | `setEffectValue()` | **0.0 – 10.0** | 存 `value / 10` |
+这意味着：
 
-   `.fac` 的 `Main`（0–127）由加载器直接写入归一化字段，所以 `Main / 127 == getEffectValue()`，经 setter 还原则是 `Main / 12.7`。
-
-**构建层面**
-
-5. **不能 glob 源码树**：`dsp/` 里有 123 个 `.c/.cpp`，但上游工程只编 **94 个**。剩下的 `Lex32org.c` 之类的 "org" 变体引用的是旧版结构体（`c_Lex.h` 里已经没有 `pre_dly_start_l`），编它直接 C2039。两份清单都由 `vendor.ps1` 从对应 `.vcxproj` 导出。
-6. **DSP 不自包含**：它引用辅助层的 `reg*` / `mth*` / `pstr*` / `file*`，缺了会有 **14 个** LNK2019。所以还要编第二批 33 个单元（`github` 上游把这批放在 `audiopassthru` 工程里）。
-7. **`UNICODE` / `_UNICODE` 藏在 `<CharacterSet>` 里**，不在 `<PreprocessorDefinitions>`。只看后者会漏，然后宽字符串调用点全部 C2664。
-8. **别加 `WIN32_LEAN_AND_MEAN`**：它把 `objbase.h` 从 `windows.h` 剔出去，`pstr.cpp` 的 `CoCreateGuid` 就变 C3861。上游没定义它。
-9. **PowerShell 5.1 的 `$ErrorActionPreference='Stop'` 会把原生命令的 stderr 变成终止性错误**。`cargo` 把进度写到 stderr，所以 `. .\toolchain.ps1; cargo build` 这个最自然的写法会莫名其妙死在 `Compiling ...` 上（报 `NativeCommandError`）。两个修法：`toolchain.ps1` 现在会在结束时把 `$ErrorActionPreference` 还原给调用方；`build.ps1` 再把「工具链 + cargo」包成一条命令。
-
-**源码补丁层面**（`vendor.ps1` 每次 vendor 时按唯一锚点幂等施加，诊断见 [`patches/README.md`](patches/README.md)）
-
-10. **`preset_list_handle_` 从未初始化**：构造函数漏了这一个成员，析构函数却对它调 `prelstFreeUp()`——释放的是堆里的野指针。实测 5 次运行里有 4 次在退出时崩溃（退出码 139，Windows 访问违例）。修法是构造函数补一行 `preset_list_handle_ = NULL;`。打完补丁后连续 14 次运行退出码全 0。
-
-> `patches/README.md` 另有一节**「已知但故意不修」**的上游缺陷。目前记录了一条：`.fac` 读取链路上 `valsRead()` 的 10 处提前 `return` 会泄漏 handle（其中 8 处还泄漏已打开的 `FILE*`），且 `loadPreset()` 把所有失败原因抹平成 `NOT_OKAY`。这类问题只记录、不进补丁表，并写明**什么条件下才值得动手**——避免补丁膨胀，同时不丢失已有结论。
-
-另外两个数值语义要记牢：
-
-- `num_frames` 是**帧数**不是总采样数（依据 `sndDevicesDoCapture.cpp:385`：`*ip_numSampleSets = capturedFramesCount`）
-- `loadPreset` 之后 `getNumEqBands()` 返回的是引擎当前段数（默认 31），**不是** `.fac` 里声明的段数（内置预设都是 10 段）。预设曲线会被映射到 31 段网格上——做 UI 时以 `getNumEqBands()` 为准，别照搬 `.fac`。
-
----
-
-## 里程碑
-
-| | 内容 | 状态 |
-|---|---|---|
-| M0 | 环境（MSVC）、vendor 源码 | ✅ 完成 |
-| M1 | DSP 离线跑通，音色与 FxSound 一致 | ✅ **通过**：94+33 单元全部编译链接，真实预设加载并改变信号 +4.42 dB，连续 14 次运行退出码全 0（含退出时析构） |
-| M2 | 驱动安装/卸载 + WASAPI 回环链路 | ✅ 完成。真机验证：1 kHz 正弦输入 0.1 → 输出 `peak 0.200`（DSP 真处理，非直通），`drop 0`、`clipped 0`。驱动**安装/卸载**路径仍需管理员，按既定计划未实机执行 |
-| M3 | 托盘常驻 + 预设切换 + 开机自启 | ✅ 完成。托盘态私有内存 **15.9 MB**（目标 < 20 MB），空闲 CPU 1.25% |
-| M4 | 点托盘弹出调音小面板 | ✅ 完成。面板为**常驻线程**（winit 的事件循环是进程级单例，不能一窗一线程），关闭后释放 GL 上下文与字体图集 |
-| M5 | 健壮性：热插拔、采样率不匹配、单声道、崩溃恢复 | ✅ 基本完成。采样率错配/单声道有单测并有配置开关；热插拔走 `IMMNotificationClient`；崩溃恢复＝`previous_default_id` 标记 + 下次启动自动归还。热插拔真机场景待补 |
-| M6 | 打包分发 | ✅ 完成。`package.ps1` 产出 `FxMini-<version>-win64.zip`（exe + 驱动三件套 + 安装/卸载脚本 + 许可 + SHA256）|
-
-### 「音频没生效」这一类的坑（M2 之后补的）
-
-真正让功能生效的那一步——**把系统默认输出设备指向虚拟声卡**——在设计里写了、代码也写了，但**全项目没有一个调用点**。症状是最难查的一种：进程正常、日志正常、预设已加载、图也建起来了，只是听不出任何区别。根因是虚拟声卡是个死胡同，没人往它写数据，引擎处理的是静音。现在由 [`src/routing.rs`](src/routing.rs) 接管与归还，见 [`docs/设计方案.md`](docs/设计方案.md) 第 6 节「坑 2」。
-
-顺带发现 `device.rs` 里手写的 `IPolicyConfig` 少解引用一层（把接口指针当成了 vtable），这段代码是**第一次真正执行**，一跑就段错误。COM 是两级间接：接口指针指向对象，对象首字才是 vtable。
+- 代码经过自动化测试（`cargo test`、`dspcheck`、`audiochk`）与真机音频链路验证，但**没有经过安全审计**；
+- 设计取舍与踩坑记录是真实的、可追溯的，见 [`docs/开发笔记.md`](docs/开发笔记.md)——可以据此判断实现是否可靠，而不必相信文档的结论；
+- 如果你要把它用在关键场景，建议自行复跑测试，并至少读一遍 [`src/routing.rs`](src/routing.rs)：**它会改动你系统的默认音频设备**。
 
 ---
 
 ## 许可
 
-本项目的 DSP 部分衍生自 [`fxsound2/fxsound-app`](https://github.com/fxsound2/fxsound-app)（Copyright © 2025 FxSound LLC，AGPL-3.0），因此整体以 **AGPL-3.0-or-later** 授权，全文见 [`LICENSE`](LICENSE)。自用无碍；若要分发，你的修改也需以 AGPL-3.0 开源。
+[**AGPL-3.0-or-later**](LICENSE)，全文见 [`LICENSE`](LICENSE)。
 
-`vendor/` 下的源码是上游文件的逐字副本（外加 [`patches/README.md`](patches/README.md) 记录的补丁），各自保留原许可；`vendor/LICENSE.fxsound-app` 即上游随源码附带的许可证文本。
+### 为什么是这个协议
 
-驱动二进制来自 FxSound 的签名包，由 `package.ps1` 原样分发，装/卸需要管理员权限。**"FxSound" 名称与图标归其所有者所有**——FxMini 是独立的、与 FxSound 无关联的项目，请不要把它当作 FxSound 的官方产品。
+这不是一个自由的选项，而是由依赖链决定的：
+
+- `vendor/dsp/` 与 `vendor/audiopassthru/` 是 [`fxsound2/fxsound-app`](https://github.com/fxsound2/fxsound-app) 的源码，授 AGPL-3.0；上游源码头写明 *"either version 3 of the License, or (at your option) any later version"*。
+- 这份代码被**静态链接进同一个 `fxmini.exe`**，因此整体构成 AGPL 的衍生作品，按 AGPL §5 必须以 AGPL-3.0 分发。
+- 换成 MIT / Apache-2.0 不成立（与 AGPL 的传染性冲突）；换成 GPL-3.0 也不成立（GPL 比 AGPL 宽松，不能作为 AGPL 代码的下游许可）。
+
+因此 `Cargo.toml` 中的 `license = "AGPL-3.0-or-later"` 采用与上游一致的表述（`-or-later` 即来自上游源码头的授权措辞）。
+
+**对你的影响**：自己使用、修改、编译都没有任何限制；一旦**分发**（包括把修改版部署成供他人使用的网络服务），你必须以 AGPL-3.0 提供完整的对应源码并保留版权声明。
+
+### 第三方与商标
+
+- `vendor/` 下是上游文件的逐字副本（外加 [`patches/README.md`](patches/README.md) 记录的补丁），各自保留原许可；`vendor/LICENSE.fxsound-app` 是上游随源码附带的许可证全文。
+- 分发包 `driver/` 中的虚拟声卡驱动来自 FxSound 的**签名二进制包**，不由本仓库以 AGPL 授权。它们按原样分发，装卸需要管理员权限；再分发涉及的商标与签名问题需自行确认。
+- **"FxSound" 名称与图标归其所有者所有。** FxMini 是独立的、与 FxSound 无关联的项目，不是 FxSound 的官方产品。
+
+---
+
+## 致谢
+
+FxMini 不重复造轮子，声音与驱动都来自上游：
+
+| 项目 | 用到的部分 | 许可 |
+|---|---|---|
+| [`fxsound2/fxsound-app`](https://github.com/fxsound2/fxsound-app) | DSP 引擎（`dsp/`）+ 辅助层（`audiopassthru/` 的 support 部分） | AGPL-3.0 |
+| [`fxsound2/fxsound-driver`](https://github.com/fxsound2/fxsound-driver) | 虚拟声卡驱动 `fxvad`（签名二进制） | AGPL-3.0 |
+
+上游公开了完整的 DSP 源码（约 9000 行 C++），公开 API 只有约 30 个方法——干净到可以当库用。这是 FxMini 得以存在的前提。
