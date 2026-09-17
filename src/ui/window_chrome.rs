@@ -674,4 +674,150 @@ mod tests {
         assert!(moved, "merely moving the pointer closed the window");
         assert!(close, "clicking the close button did not close the window");
     }
+
+    /// Runs one frame per entry in `events` (a `None` is a frame with no input)
+    /// against [`resize_border`], and collects every viewport command they
+    /// produced between them.
+    fn resize_frames(
+        ctx: &egui::Context,
+        window: Rect,
+        maximized: bool,
+        events: Vec<Option<egui::Event>>,
+    ) -> Vec<ViewportCommand> {
+        let mut commands = Vec::new();
+        for event in events {
+            let full = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(window),
+                    events: event.into_iter().collect(),
+                    ..Default::default()
+                },
+                |_| resize_border(ctx, maximized),
+            );
+            commands.extend(
+                full.viewport_output
+                    .into_values()
+                    .flat_map(|viewport| viewport.commands),
+            );
+        }
+        commands
+    }
+
+    /// A pointer event at `pos`, pressed or released.
+    fn pointer_at(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    /// How many frames of no input a fresh border needs before the pointer is
+    /// really over it.
+    ///
+    /// Not padding, and measured rather than guessed: an `Area` is hit-tested
+    /// from the list the *previous* frame built, so a zone that first exists on
+    /// frame 1 is invisible to the pointer on frame 2 and only live from frame
+    /// 3. In the running panel that is 60 ms of startup nobody can see, but a
+    /// test that presses on frame 2 measures the warm-up instead of the border.
+    const SETTLE_FRAMES: usize = 2;
+
+    /// The frames a test needs to press on a settled border: point at it, let it
+    /// settle, press, release.
+    fn point_settle_press_release(corner: Pos2) -> Vec<Option<egui::Event>> {
+        let mut events = vec![Some(egui::Event::PointerMoved(corner))];
+        events.extend(std::iter::repeat_n(None, SETTLE_FRAMES));
+        events.push(Some(pointer_at(corner, true)));
+        events.push(Some(pointer_at(corner, false)));
+        events
+    }
+
+    /// A press on the border actually asks the platform for a resize.
+    ///
+    /// The tests above say the zones are in the right places; this one says they
+    /// are *reachable*. An `Area` that never gets allocated, or a `Sense` that
+    /// never reports a drag, would satisfy every one of them and still leave a
+    /// window nobody can resize — which, in an undecorated window, is the whole
+    /// of the resize affordance.
+    #[test]
+    fn pressing_the_border_asks_for_a_resize() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let window = window();
+        let corner = zones(window)[0].0.center();
+        let commands = resize_frames(&ctx, window, false, point_settle_press_release(corner));
+
+        assert!(
+            commands.iter().any(|command| matches!(
+                command,
+                ViewportCommand::BeginResize(ResizeDirection::NorthWest)
+            )),
+            "a press in the top-left corner asked for {commands:?}"
+        );
+    }
+
+    /// The zones win against whatever they overlap.
+    ///
+    /// This is the whole reason they are widgets on the foreground layer rather
+    /// than coordinates tested against the pointer. The caption's buttons touch
+    /// the top edge, so a press in the corner they share reaches one of them;
+    /// if the button saw it too, the press would start a resize *and* press the
+    /// button — and since a resize hands the mouse to an OS modal loop, the
+    /// button would never see its release and would be left stuck down.
+    #[test]
+    fn a_resize_zone_wins_against_a_widget_underneath_it() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let window = window();
+        let corner = zones(window)[0].0.center();
+
+        // A stand-in for the panel: an ordinary widget in the background layer,
+        // sitting exactly where the corner zone sits on top of it.
+        let panel = Rect::from_min_size(Pos2::ZERO, Vec2::splat(64.0));
+
+        let mut under = None;
+        for event in point_settle_press_release(corner) {
+            let mut hovered = false;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(window),
+                    events: event.into_iter().collect(),
+                    ..Default::default()
+                },
+                |ui| {
+                    hovered = ui.interact(panel, Id::new("panel"), Sense::click()).hovered();
+                    resize_border(&ctx, false);
+                },
+            );
+            under = Some(hovered);
+        }
+
+        assert_eq!(
+            under,
+            Some(false),
+            "the widget under the corner still saw the pointer"
+        );
+    }
+
+    /// While maximised there is no border to grab: the zones would sit on the
+    /// screen's own edges and swallow clicks meant for the desktop.
+    #[test]
+    fn a_maximised_window_offers_no_resize_zones() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+
+        let window = window();
+        let corner = zones(window)[0].0.center();
+        let commands = resize_frames(&ctx, window, true, point_settle_press_release(corner));
+
+        assert!(
+            commands
+                .iter()
+                .all(|command| !matches!(command, ViewportCommand::BeginResize(_))),
+            "a maximised window still offered a resize: {commands:?}"
+        );
+    }
 }
