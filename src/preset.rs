@@ -510,7 +510,7 @@ mod tests {
     #[test]
     fn tolerates_crlf_and_bom() {
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
-        bytes.extend_from_slice(&MUSIC.to_vec());
+        bytes.extend_from_slice(MUSIC);
         // The bundled files are already CRLF; this only asserts the BOM path.
         let preset = FacPreset::from_bytes(Path::new("Music.fac"), &bytes).unwrap();
         assert_eq!(preset.mains[0], 50);

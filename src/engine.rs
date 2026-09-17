@@ -143,7 +143,7 @@ impl StreamFormat {
         let container_bits = base.wBitsPerSample;
         let mut valid_bits = base.wBitsPerSample;
 
-        let kind = if base.wFormatTag == WAVE_FORMAT_EXTENSIBLE as u16 {
+        let kind = if base.wFormatTag == WAVE_FORMAT_EXTENSIBLE {
             let ext = &*(format as *const WAVEFORMATEXTENSIBLE);
             valid_bits = ext.Samples.wValidBitsPerSample;
             let sub = ext.SubFormat;
@@ -1730,7 +1730,7 @@ fn run_graph(
             // here. Eight render cycles is roughly 20 ms at a 128-frame buffer —
             // fast enough to look live, slow enough to be free.
             meter_tick = meter_tick.wrapping_add(1);
-            if meter_tick % 8 == 0 {
+            if meter_tick.is_multiple_of(8) {
                 let mut bars = [0.0f32; SPECTRUM_BANDS];
                 dsp.spectrum(&mut bars);
                 for (index, value) in bars.iter().enumerate() {

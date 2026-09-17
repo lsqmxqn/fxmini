@@ -131,14 +131,14 @@ impl std::fmt::Display for DeviceState {
 
 impl From<DEVICE_STATE> for DeviceState {
     fn from(state: DEVICE_STATE) -> Self {
-        let raw = state.0 as u32;
-        if raw & DEVICE_STATE_ACTIVE.0 as u32 != 0 {
+        let raw = state.0;
+        if raw & DEVICE_STATE_ACTIVE.0 != 0 {
             DeviceState::Active
-        } else if raw & DEVICE_STATE_DISABLED.0 as u32 != 0 {
+        } else if raw & DEVICE_STATE_DISABLED.0 != 0 {
             DeviceState::Disabled
-        } else if raw & DEVICE_STATE_NOTPRESENT.0 as u32 != 0 {
+        } else if raw & DEVICE_STATE_NOTPRESENT.0 != 0 {
             DeviceState::NotPresent
-        } else if raw & DEVICE_STATE_UNPLUGGED.0 as u32 != 0 {
+        } else if raw & DEVICE_STATE_UNPLUGGED.0 != 0 {
             DeviceState::Unplugged
         } else {
             DeviceState::Unknown

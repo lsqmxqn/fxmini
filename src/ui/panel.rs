@@ -55,6 +55,16 @@
 //! depends on the card set, the font metrics and the width, and which no
 //! constant gets right.
 //!
+//! ## The window's own chrome
+//!
+//! The window is created without system decorations and its caption is drawn by
+//! the panel, from the same tokens as everything under it — a grey Windows 10
+//! title bar on top of eight-point rounded cards was two design languages in one
+//! window. [`super::window_chrome`] has the long version; the short one is that
+//! an undecorated window also has no move loop and no resize border, and both
+//! have to be wired up by hand. The caption's height joins the header and footer
+//! in the arithmetic below, since it is chrome the cards are not.
+//!
 //! Colours and metrics come from [`super::theme`]; nothing below names a hex
 //! literal, so the panel follows the system theme and stays readable in both.
 //!
@@ -83,7 +93,9 @@ use eframe::egui::{
 use crate::engine::{EngineHandle, EngineStatus, SharedParams, MAX_BANDS, SPECTRUM_BANDS};
 use crate::i18n::{self, PanelText};
 use crate::preset::PresetEntry;
+use crate::ui::icon_raster;
 use crate::ui::theme::{self, radius, space, Palette};
+use crate::ui::window_chrome;
 use crate::ui::window_shape::RoundedWindow;
 
 /// Set while a panel window exists, so a second tray click focuses the existing
@@ -159,6 +171,26 @@ fn panel_sender() -> Option<&'static mpsc::Sender<PanelShared>> {
     }
 }
 
+/// Edge length of the window icon, in pixels.
+///
+/// 64 where the tray icon takes 32: this bitmap is also what the shell draws in
+/// the Alt-Tab thumbnail, and at 32 it is visibly soft there. The shells that
+/// draw it small downsample, which costs nothing.
+const WINDOW_ICON_SIZE: u32 = 64;
+
+/// The window's icon, from the same artwork as the tray icon.
+///
+/// Set explicitly rather than left to the shell's fallback. A window that sets
+/// no icon gets its window *class*'s, and the class here belongs to the toolkit,
+/// so the fallback is a small egui logo beside a small FxMini.
+fn window_icon() -> egui::IconData {
+    egui::IconData {
+        rgba: icon_raster::render_rgba(WINDOW_ICON_SIZE),
+        width: WINDOW_ICON_SIZE,
+        height: WINDOW_ICON_SIZE,
+    }
+}
+
 /// Serves panel windows, one at a time, for the life of the process.
 ///
 /// The thread outlives each window, and that is forced by winit: it allows
@@ -178,6 +210,15 @@ fn panel_thread(rx: mpsc::Receiver<PanelShared>) {
         let options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_title("FxMini")
+                // The panel draws its own caption, so the system one is turned
+                // off: see [`crate::ui::window_chrome`] for why, and for the
+                // move loop and resize border that have to be put back by hand
+                // once it is gone.
+                .with_decorations(false)
+                // The same artwork the tray icon and the executable's icon group
+                // are made from, so the taskbar entry, Alt-Tab and the panel
+                // cannot disagree about what this program looks like.
+                .with_icon(window_icon())
                 // Opening size, not the final one: a provisional height the
                 // panel corrects against its own content on the first frame
                 // (see `PanelApp::fit_to_content`). Width is real — it is
@@ -315,9 +356,11 @@ const OPENING_PANEL_HEIGHT: f32 = 620.0;
 /// The shortest the panel can be squeezed to, and the floor
 /// [`PanelApp::fit_to_content`] will not go below.
 ///
-/// The header, the footer, and the equalizer card are what has to be reachable
-/// at this size; everything else is one scroll away.
-const MIN_PANEL_HEIGHT: f32 = 480.0;
+/// The caption, the header, the footer, and the equalizer card are what has to
+/// be reachable at this size; everything else is one scroll away. 480 of content
+/// plus the caption's 32 — the caption grew the window when it stopped being the
+/// system's, and this is the number that had to grow with it.
+const MIN_PANEL_HEIGHT: f32 = 512.0;
 
 /// How much of the monitor the fitted window leaves alone, in points.
 ///
@@ -851,14 +894,22 @@ fn is_a_usable_filename(name: &str) -> bool {
 impl eframe::App for PanelApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let maximized = window_chrome::is_maximized(&ctx);
 
         // Before anything is laid out, so the frame about to be presented is
         // already clipped. A region applies to the window rather than to a
         // frame, so doing this at the end of the pass would round the *next*
         // frame instead — and on a panel that only redraws while something is
         // moving, that is a square-cornered flash on open.
-        self.shape
-            .apply(frame, ctx.pixels_per_point(), radius::CARD as f32);
+        //
+        // A maximised window is left square: its corners are the screen's, and
+        // cutting them would show the desktop through the gaps.
+        self.shape.apply(
+            frame,
+            ctx.pixels_per_point(),
+            radius::CARD as f32,
+            maximized,
+        );
 
         // A save that finished since the last frame, or a preset folder that
         // changed. Done first so the combo box and the footer below both see
@@ -880,9 +931,22 @@ impl eframe::App for PanelApp {
         let palette = theme::palette(&ctx);
         let text = &i18n::t().panel;
 
-        // Both panels are measured as they are built, because how tall the
-        // window has to be is "the cards, plus whatever these two took" — and
-        // only egui knows that.
+        // The window's own caption, above everything else and spanning the full
+        // width: its buttons have to reach the window's corners, so it cannot be
+        // inside anything with a margin. The surface colour is the same one the
+        // header below uses, which is what makes the two read as one top band
+        // rather than two stacked bars.
+        let caption_height = egui::Panel::top("caption")
+            .exact_size(window_chrome::CAPTION_HEIGHT)
+            .frame(egui::Frame::default().fill(palette.surface))
+            .show(ui, |ui| window_chrome::caption(ui, palette))
+            .response
+            .rect
+            .height();
+
+        // The rest of the panels are measured as they are built, because how
+        // tall the window has to be is "the cards, plus whatever the chrome
+        // took" — and only egui knows that.
         let header_height = egui::Panel::top("header")
             .frame(
                 egui::Frame::default()
@@ -968,7 +1032,18 @@ impl eframe::App for PanelApp {
             })
             .inner;
 
-        self.fit_to_content(&ctx, content.content_size, header_height + footer_height);
+        self.fit_to_content(
+            &ctx,
+            content.content_size,
+            caption_height + header_height + footer_height,
+        );
+
+        // Last, and on their own layer. The resize zones have to be able to win
+        // against whatever they overlap — including the caption's buttons, which
+        // touch the top edge — so they are drawn where egui hit-tests them
+        // first; see [`crate::ui::window_chrome`].
+        window_chrome::resize_border(&ctx, maximized);
+        window_chrome::outline(&ctx, palette, maximized);
 
         // ~30 fps is plenty for meters, and keeps the window from spinning the
         // GPU when nothing is happening.
@@ -979,9 +1054,10 @@ impl eframe::App for PanelApp {
 impl PanelApp {
     /// Status on the left, the master switch on the right.
     ///
-    /// The window title bar already says "FxMini", so this row does not repeat
-    /// it: what a glance should answer is whether audio is being processed and
-    /// whether the thing is on at all.
+    /// The caption above already says "FxMini", so this row does not repeat it:
+    /// what a glance should answer is whether audio is being processed and
+    /// whether the thing is on at all. The caption is the panel's own, drawn in
+    /// [`crate::ui::window_chrome`] — the system one is off.
     fn header(
         &mut self,
         ui: &mut egui::Ui,
@@ -1939,9 +2015,10 @@ mod tests {
     /// languages lay out at different heights because the CJK face is taller.
     #[test]
     fn the_window_is_asked_to_fit_its_content() {
-        // Header 38 + footer 152, and enough cards to need scrolling at any
-        // window size a person would accept.
-        assert_eq!(fitted_height(760.0, 190.0, Some(1080.0)), 950.0);
+        // Caption 32 + header 38 + footer 152, and enough cards to need
+        // scrolling at any window size a person would accept.
+        let chrome = window_chrome::CAPTION_HEIGHT + 190.0;
+        assert_eq!(fitted_height(760.0, chrome, Some(1080.0)), 982.0);
     }
 
     /// A window taller than the monitor hides its own bottom edge.
@@ -1959,12 +2036,19 @@ mod tests {
     }
 
     /// A window shorter than the floor is useless even when it fits.
+    ///
+    /// The caption counts against the floor like any other chrome; it is drawn
+    /// by the panel now, so nothing stops a future edit from forgetting that it
+    /// takes up room the cards used to have.
     #[test]
-    fn the_window_never_shrinks_past_the_header_and_the_footer() {
-        assert_eq!(fitted_height(0.0, 0.0, Some(1080.0)), MIN_PANEL_HEIGHT);
+    fn the_window_never_shrinks_past_its_chrome() {
+        assert_eq!(
+            fitted_height(0.0, window_chrome::CAPTION_HEIGHT, Some(1080.0)),
+            MIN_PANEL_HEIGHT
+        );
         // A tiny monitor: the floor still wins, so the OS clamps the window
         // instead of this code producing one too short for its own controls.
-        assert_eq!(fitted_height(600.0, 190.0, Some(300.0)), MIN_PANEL_HEIGHT);
+        assert_eq!(fitted_height(600.0, 222.0, Some(300.0)), MIN_PANEL_HEIGHT);
     }
 
     /// The preset popup holds a whole number of rows, and no row changes height.

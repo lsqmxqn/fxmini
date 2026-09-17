@@ -14,18 +14,24 @@
 //!   gives a card — the steps are about a physical pixel, which does not read as
 //!   jagged at normal viewing distance but is not the compositor's antialiasing
 //!   either.
-//! * The region clips the *whole* window, non-client frame included, so the
-//!   title bar's corners are cut along with the client area's. That is the
-//!   intent: a square title bar sitting on rounded content would be worse than
-//!   either shape on its own. It also means the region has to be sized from the
-//!   window rectangle, not from egui's client rect — sizing it to the client
-//!   area would leave the last strip of the frame square, which is the artefact
-//!   that makes a hand-rounded window look broken.
+//! * The region clips the *whole* window. The panel draws its own caption now
+//!   (see [`super::window_chrome`]) and the window has no decorations, so the
+//!   window rectangle and the client area happen to be the same rectangle — but
+//!   the region is still sized from `GetWindowRect`, which is the rectangle
+//!   Windows itself measures a region against. The two agree today and would
+//!   stop agreeing the day anything puts a system frame back.
+//! * A maximised window is left square. Its corners are the corners of the
+//!   screen, so cutting them would take four bites out of the desktop and show
+//!   whatever is behind the window through them. [`RoundedWindow::apply`] clears
+//!   the region for as long as the window is maximised, and cuts a fresh one
+//!   when it is restored.
 //!
 //! On Windows 11 the DWM has already rounded the frame, so this repeats a shape
 //! the compositor chose itself. It is applied on every version anyway rather
 //! than behind a build-number check: one code path, and no branch that only ever
-//! runs on the machine nobody is testing on.
+//! runs on the machine nobody is testing on. It also matters more than it used
+//! to: the DWM rounds a *decorated* window by default, and stops once the
+//! decorations are gone.
 //!
 //! The tray menu is deliberately *not* rounded. It is a Win32 popup menu drawn
 //! by the system, and the one hook that could have caught its first frame
@@ -38,17 +44,22 @@ use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn};
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 use windows_core::Free as _;
 
-/// Cuts the panel window's corners off with a window region.
+/// Cuts the panel window's corners off with a window region, unless the window
+/// is maximised.
 ///
 /// Stateful because `SetWindowRgn` is a one-shot call: the clip stays in force
 /// until it is replaced, so the region only needs rebuilding when the window
-/// changes size. Rebuilding it every frame would allocate and hand over a GDI
-/// object thirty times a second to say the same thing.
+/// changes size or when it is maximised or restored. Rebuilding it every frame
+/// would allocate and hand over a GDI object thirty times a second to say the
+/// same thing.
 #[derive(Default)]
 pub struct RoundedWindow {
     /// The panel's window, resolved on the first frame and then kept.
     hwnd: Option<HWND>,
     /// The physical size the region currently in force was cut for.
+    ///
+    /// `None` means no region is in force: either none has been cut yet, or the
+    /// one that was has been cleared because the window is maximised.
     applied: Option<(i32, i32)>,
 }
 
@@ -64,11 +75,33 @@ impl RoundedWindow {
     /// and a region is measured in physical pixels, so taking the point value
     /// straight would clip the wrong amount on a scaled display.
     ///
-    /// A no-op after the first successful call at a given size.
-    pub fn apply(&mut self, frame: &eframe::Frame, pixels_per_point: f32, radius: f32) {
+    /// `maximized` removes the region instead of setting one, and is the only
+    /// reason this is not a no-op after its first successful call.
+    pub fn apply(
+        &mut self,
+        frame: &eframe::Frame,
+        pixels_per_point: f32,
+        radius: f32,
+        maximized: bool,
+    ) {
         let Some(window) = self.window(frame) else {
             return;
         };
+
+        if maximized {
+            if self.applied.is_some() {
+                // SAFETY: a live HWND, and a null region, which is the
+                // documented way to say "no region": the window reverts to its
+                // own rectangle. Nothing is owned or freed by this call.
+                unsafe {
+                    let _ = SetWindowRgn(window, None, true);
+                }
+                // Forgotten so that restoring the window cuts a fresh region
+                // rather than trusting one that is no longer there.
+                self.applied = None;
+            }
+            return;
+        }
 
         let mut rect = RECT::default();
         // SAFETY: `window` is a live HWND copied out of the frame, and `rect` is
