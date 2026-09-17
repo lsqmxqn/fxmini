@@ -178,7 +178,13 @@ impl App {
             self.refresh();
         }
 
-        match self.tray.poll() {
+        // The menu is asked first, then the icon's own clicks. A right-click
+        // emits a click event as well as opening the menu, and the menu event is
+        // the one carrying meaning; asking in this order means a stray click
+        // event cannot shadow a menu choice.
+        let action = self.tray.poll().or_else(|| self.tray.poll_icon());
+
+        match action {
             Some(TrayAction::Quit) => return true,
             Some(TrayAction::ToggleEnabled) => self.toggle_enabled(),
             Some(TrayAction::ToggleAutostart) => self.toggle_autostart(),
@@ -403,47 +409,25 @@ impl App {
         log::info!("preset list refreshed: {} entries", self.presets.len());
     }
 
-    /// Switches the interface language and rebuilds the tray menu.
+    /// Switches the interface language and relabels the tray menu in place.
     ///
-    /// The menu has to be rebuilt rather than relabelled: `muda` exposes no text
-    /// setter, so there is no way to change a label on an item that already
-    /// exists. The notification-area icon is recreated along with the menu,
-    /// which is visible as a blink — cheaper than keeping a shadow copy of
-    /// every label to patch in later.
+    /// The tray is relabelled, not rebuilt. It used to be destroyed and
+    /// recreated around a belief that `muda` had no text setter; it has, and a
+    /// rebuild is a strictly worse way to change a word — it can fail, it
+    /// blinks the icon out of the notification area, and the failure mode of
+    /// the error path is a process with no user interface at all.
     ///
     /// The panel needs none of this: it re-reads the string table each frame,
     /// so an open panel changes language on its next repaint.
     fn set_language(&mut self, language: Lang) {
-        let previous = i18n::current();
-        if language == previous {
+        if language == i18n::current() {
             return;
         }
 
         i18n::set(language);
-        let status = std::sync::Arc::clone(self.handle.status());
-        let driver_present = status.virtual_present() || device::virtual_device_present();
-        let rebuilt = Tray::new(
-            &self.presets,
-            self.handle.params().is_enabled(),
-            crate::autostart::is_enabled(),
-            driver_present,
-        );
-
-        let tray = match rebuilt {
-            Ok(tray) => tray,
-            Err(err) => {
-                // Put the strings back rather than leave the panel in one
-                // language and the menu in another.
-                i18n::set(previous);
-                log::error!("could not rebuild the tray menu in {}: {err}", language.endonym());
-                return;
-            }
-        };
-        self.tray = tray;
-
-        // `Tray::new` ticks nothing: the preset selection is state this struct
-        // owns, so the freshly built menu has to be told about it.
-        self.tray.set_active_preset(self.active_preset.as_deref());
+        // See `Tray::retitle` for what has to be rewritten and why the route
+        // entry is not simply assigned.
+        self.tray.retitle();
 
         // Recorded as an explicit choice, replacing "auto": the user has now
         // said which language they want, and a later change to the system

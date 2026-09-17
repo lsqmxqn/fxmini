@@ -177,6 +177,14 @@ pub struct Strings {
 pub struct TrayText {
     pub enabled: &'static str,
     pub route_through: &'static str,
+    /// Shown *instead of* [`Self::route_through`] once audio is already going
+    /// through the virtual card.
+    ///
+    /// The entry used to be greyed out in that state, which reads as "you
+    /// cannot use this" — indistinguishable from a broken install. Naming the
+    /// state instead means the disabled item answers the question the user came
+    /// to ask, which is "is my audio actually being enhanced?".
+    pub route_through_done: &'static str,
     pub panel: &'static str,
     pub presets: &'static str,
     pub no_presets: &'static str,
@@ -240,6 +248,12 @@ pub struct PanelText {
 
     pub equalizer: &'static str,
     pub bands: &'static str,
+    /// One line explaining the curve gesture. The curve is the panel's only
+    /// control with no affordance borrowed from a widget the user has met
+    /// before, so it says so rather than relying on discovery.
+    pub eq_hint: &'static str,
+    /// Button that flattens every band back to 0 dB.
+    pub eq_reset: &'static str,
 
     pub output: &'static str,
     pub balance: &'static str,
@@ -250,15 +264,31 @@ pub struct PanelText {
 
     pub spectrum: &'static str,
 
-    pub save_heading: &'static str,
     pub save_name_hint: &'static str,
     pub save_button: &'static str,
     pub save_help: &'static str,
+    /// The line the footer shows where a save result will appear, so the footer
+    /// keeps its height and the reader learns where presets land.
+    pub save_where: &'static str,
+
+    /// Prefixes for the two device lines. Written out per language rather than
+    /// left as `in:`/`out:`: the line is elided now, so the few pixels the
+    /// longer word costs buy a reader who does not parse the abbreviations.
+    pub device_in_prefix: &'static str,
+    pub device_out_prefix: &'static str,
 
     /// Footer counters. The number is appended by the methods below.
     pub latency_label: &'static str,
     pub underruns_label: &'static str,
     pub drops_label: &'static str,
+    /// Unit for the *exact* underrun figure, which is a count of frames.
+    pub frames_unit: &'static str,
+
+    /// Which scale [`PanelText::abbreviate`] should group large counters by.
+    ///
+    /// A property of the language, not of any one string, so it belongs in the
+    /// table rather than being inferred from the text.
+    pub groups_by_ten_thousand: bool,
 
     /// Save-result messages.
     pub saved_ok: &'static str,
@@ -269,32 +299,103 @@ pub struct PanelText {
 }
 
 impl PanelText {
-    /// `in:  <device>`, or `in: —` when there is nothing to report.
+    /// `输入  <device>`, or `输入  —` when there is nothing to report.
     pub fn input_line(&self, description: Option<&str>) -> String {
-        self.device_line("in:", description)
+        self.device_line(self.device_in_prefix, description)
     }
 
-    /// `out: <device>`, or `out: —`.
+    /// `输出  <device>`, or `输出  —`.
     pub fn output_line(&self, description: Option<&str>) -> String {
-        self.device_line("out:", description)
+        self.device_line(self.device_out_prefix, description)
     }
 
-    /// `in:`/`out:` stay as-is in both languages: they are narrow enough not to
-    /// wrap in the footer, and a device name beside them explains itself.
     fn device_line(&self, label: &str, description: Option<&str>) -> String {
         format!("{label}  {}", description.unwrap_or("—"))
+    }
+
+    /// A frequency on the equalizer's axis: `31 Hz`, `1.0 kHz`.
+    ///
+    /// Shared by the curve's axis and its readout so the two cannot disagree
+    /// about where a band is.
+    pub fn frequency(&self, hz: f32) -> String {
+        if hz >= 1000.0 {
+            format!("{:.1} kHz", hz / 1000.0)
+        } else {
+            format!("{hz:.0} Hz")
+        }
+    }
+
+    /// A gain with an explicit sign and one decimal, so a column of them is the
+    /// same width and `+` versus `-` is visible at a glance.
+    pub fn gain(&self, db: f32) -> String {
+        // Rounded before the sign is chosen: a band sitting at -0.04 dB would
+        // otherwise print "-0.0", which reads as a cut that is not there.
+        let rounded = (db * 10.0).round() / 10.0;
+        if rounded == 0.0 {
+            "0.0".to_owned()
+        } else {
+            format!("{rounded:+.1}")
+        }
+    }
+
+    /// A gain with its unit, for the curve readout.
+    pub fn gain_db(&self, db: f32) -> String {
+        format!("{} dB", self.gain(db))
     }
 
     pub fn latency(&self, ms: u32) -> String {
         format!("{} {ms} ms", self.latency_label)
     }
 
-    pub fn underruns(&self, count: u64) -> String {
-        format!("{} {count}", self.underruns_label)
+    /// The footer's underrun figure, abbreviated.
+    ///
+    /// The raw number is a **frame count**, which at 48 kHz reaches eight
+    /// digits within minutes — the old footer printed `欠载 24302880`, which is
+    /// a fact nobody can act on. [`Self::stats_detail`] carries the exact value
+    /// for a hover tooltip.
+    pub fn underruns(&self, frames: u64) -> String {
+        format!("{} {}", self.underruns_label, self.abbreviate(frames))
     }
 
     pub fn drops(&self, count: u64) -> String {
-        format!("{} {count}", self.drops_label)
+        format!("{} {}", self.drops_label, self.abbreviate(count))
+    }
+
+    /// The same three numbers, unrounded, for the hover tooltip.
+    pub fn stats_detail(&self, latency_ms: u32, underrun_frames: u64, drops: u64) -> String {
+        format!(
+            "{}\n{} {} {}\n{} {}",
+            self.latency(latency_ms),
+            self.underruns_label,
+            underrun_frames,
+            self.frames_unit,
+            self.drops_label,
+            drops
+        )
+    }
+
+    /// Abbreviates a large counter using this language's own scale.
+    ///
+    /// Thousands groups differ by locale — English counts in K/M, Chinese in
+    /// 万/亿 — so this cannot be one implementation shared by both tables.
+    fn abbreviate(&self, n: u64) -> String {
+        if self.groups_by_ten_thousand {
+            if n >= 100_000_000 {
+                format!("{:.2} 亿", n as f64 / 100_000_000.0)
+            } else if n >= 10_000 {
+                format!("{:.1} 万", n as f64 / 10_000.0)
+            } else {
+                n.to_string()
+            }
+        } else if n >= 1_000_000_000 {
+            format!("{:.1}B", n as f64 / 1_000_000_000.0)
+        } else if n >= 1_000_000 {
+            format!("{:.1}M", n as f64 / 1_000_000.0)
+        } else if n >= 10_000 {
+            format!("{:.1}K", n as f64 / 1000.0)
+        } else {
+            n.to_string()
+        }
     }
 
     /// The message shown after a save, given the file that was written and
@@ -314,6 +415,7 @@ static ZH: Strings = Strings {
     tray: TrayText {
         enabled: "启用音效",
         route_through: "输出走 FxMini",
+        route_through_done: "输出已走 FxMini",
         panel: "调音面板…",
         presets: "预设",
         no_presets: "（无预设）",
@@ -348,6 +450,8 @@ static ZH: Strings = Strings {
 
         equalizer: "均衡器",
         bands: "频段数",
+        eq_hint: "拖动圆点调增益，双击归零",
+        eq_reset: "归零",
 
         output: "输出",
         balance: "左右平衡",
@@ -358,13 +462,17 @@ static ZH: Strings = Strings {
 
         spectrum: "频谱",
 
-        save_heading: "保存为预设",
         save_name_hint: "预设名称",
         save_button: "保存",
         save_help: "把当前的音效、均衡与输出设置存成一个 .fac 文件，之后可在托盘菜单或上方列表中选用。",
+        save_where: "存入 %APPDATA%\\FxMini\\presets",
+        device_in_prefix: "输入",
+        device_out_prefix: "输出",
         latency_label: "延迟",
         underruns_label: "欠载",
         drops_label: "丢帧",
+        frames_unit: "帧",
+        groups_by_ten_thousand: true,
 
         saved_ok: "已保存 {}",
         save_name_required: "请先填写预设名称",
@@ -378,7 +486,8 @@ static ZH: Strings = Strings {
 static EN: Strings = Strings {
     tray: TrayText {
         enabled: "Enabled",
-        route_through: "Route through FxMini",
+        route_through: "Route output via FxMini",
+        route_through_done: "Output routed via FxMini",
         panel: "Tuning panel…",
         presets: "Presets",
         no_presets: "(none found)",
@@ -413,6 +522,8 @@ static EN: Strings = Strings {
 
         equalizer: "Equalizer",
         bands: "Bands",
+        eq_hint: "Drag a dot to set its gain; double-click to reset it",
+        eq_reset: "Flatten",
 
         output: "Output",
         balance: "Balance",
@@ -423,14 +534,18 @@ static EN: Strings = Strings {
 
         spectrum: "Spectrum",
 
-        save_heading: "Save as preset",
         save_name_hint: "Preset name",
         save_button: "Save",
         save_help: "Stores the current effects, equalizer and output settings as a .fac file, \
                     selectable from the tray menu or the list above.",
+        save_where: "Saved into %APPDATA%\\FxMini\\presets",
+        device_in_prefix: "In",
+        device_out_prefix: "Out",
         latency_label: "latency",
         underruns_label: "underruns",
         drops_label: "drops",
+        frames_unit: "frames",
+        groups_by_ten_thousand: false,
 
         saved_ok: "Saved {}",
         save_name_required: "Give the preset a name first",
@@ -474,6 +589,7 @@ mod tests {
             for (name, value) in [
                 ("enabled", tray.enabled),
                 ("route_through", tray.route_through),
+                ("route_through_done", tray.route_through_done),
                 ("panel", tray.panel),
                 ("presets", tray.presets),
                 ("no_presets", tray.no_presets),
@@ -508,6 +624,8 @@ mod tests {
                 ("effect_bass", panel.effect_bass),
                 ("equalizer", panel.equalizer),
                 ("bands", panel.bands),
+                ("eq_hint", panel.eq_hint),
+                ("eq_reset", panel.eq_reset),
                 ("output", panel.output),
                 ("balance", panel.balance),
                 ("master_gain", panel.master_gain),
@@ -515,13 +633,16 @@ mod tests {
                 ("volume_leveling", panel.volume_leveling),
                 ("filter_q", panel.filter_q),
                 ("spectrum", panel.spectrum),
-                ("save_heading", panel.save_heading),
                 ("save_name_hint", panel.save_name_hint),
                 ("save_button", panel.save_button),
                 ("save_help", panel.save_help),
+                ("save_where", panel.save_where),
+                ("device_in_prefix", panel.device_in_prefix),
+                ("device_out_prefix", panel.device_out_prefix),
                 ("latency_label", panel.latency_label),
                 ("underruns_label", panel.underruns_label),
                 ("drops_label", panel.drops_label),
+                ("frames_unit", panel.frames_unit),
                 ("saved_ok", panel.saved_ok),
                 ("save_name_required", panel.save_name_required),
                 ("save_name_invalid", panel.save_name_invalid),
@@ -589,9 +710,63 @@ mod tests {
 
     #[test]
     fn device_lines_fall_back_to_a_dash() {
-        assert_eq!(ZH.panel.input_line(None), "in:  —");
-        assert_eq!(EN.panel.output_line(Some("Speakers")), "out:  Speakers");
+        assert_eq!(ZH.panel.input_line(None), "输入  —");
+        assert_eq!(EN.panel.output_line(Some("Speakers")), "Out  Speakers");
         assert_eq!(ZH.panel.latency(120), "延迟 120 ms");
         assert_eq!(EN.panel.underruns(3), "underruns 3");
+    }
+
+    /// The underrun counter is a frame count, which is why it needs this: the
+    /// old footer printed `欠载 24302880`, eight digits of a unit nobody
+    /// reasons in. Both languages group digits their own way, so the scale has
+    /// to come from the table rather than be shared.
+    #[test]
+    fn large_counters_are_abbreviated_in_the_languages_own_scale() {
+        assert_eq!(ZH.panel.underruns(0), "欠载 0");
+        assert_eq!(ZH.panel.underruns(9_999), "欠载 9999");
+        assert_eq!(ZH.panel.underruns(24_302_880), "欠载 2430.3 万");
+        assert_eq!(ZH.panel.underruns(250_000_000), "欠载 2.50 亿");
+
+        assert_eq!(EN.panel.underruns(0), "underruns 0");
+        assert_eq!(EN.panel.underruns(9_999), "underruns 9999");
+        assert_eq!(EN.panel.underruns(24_302_880), "underruns 24.3M");
+        assert_eq!(EN.panel.underruns(2_500_000_000), "underruns 2.5B");
+    }
+
+    /// Abbreviating the footer is only acceptable because the exact figure is
+    /// still reachable, so the tooltip has to carry it.
+    #[test]
+    fn the_detail_tooltip_keeps_the_exact_figure() {
+        let detail = ZH.panel.stats_detail(12, 24_302_880, 2);
+        assert!(detail.contains("24302880"), "{detail}");
+        assert!(detail.contains("延迟 12 ms"), "{detail}");
+        assert!(detail.contains("丢帧 2"), "{detail}");
+    }
+
+    /// The curve's axis and its readout both format a frequency; if they ever
+    /// disagreed a band's label would not match the dot under the pointer.
+    #[test]
+    fn frequency_and_gain_formatting_is_shared() {
+        for text in [&ZH.panel, &EN.panel] {
+            assert_eq!(text.frequency(31.0), "31 Hz");
+            assert_eq!(text.frequency(999.0), "999 Hz");
+            assert_eq!(text.frequency(1000.0), "1.0 kHz");
+            assert_eq!(text.frequency(16_000.0), "16.0 kHz");
+
+            assert_eq!(text.gain(3.0), "+3.0");
+            assert_eq!(text.gain(-1.3), "-1.3");
+            assert_eq!(text.gain_db(3.0), "+3.0 dB");
+        }
+    }
+
+    /// A band parked a hair below zero must not read as a cut.
+    #[test]
+    fn a_negligible_gain_prints_without_a_sign() {
+        for snap in [0.0, -0.0, 0.04, -0.04] {
+            assert_eq!(ZH.panel.gain(snap), "0.0", "{snap} should print unsigned");
+        }
+        // …but a tenth of a decibel in either direction is a real setting.
+        assert_eq!(ZH.panel.gain(0.1), "+0.1");
+        assert_eq!(ZH.panel.gain(-0.1), "-0.1");
     }
 }

@@ -8,6 +8,7 @@
 pub mod icon;
 pub mod icon_raster;
 pub mod panel;
+pub mod theme;
 pub mod tray;
 
 use windows::Win32::Foundation::HWND;
