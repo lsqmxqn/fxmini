@@ -10,6 +10,7 @@ pub mod icon_raster;
 pub mod panel;
 pub mod theme;
 pub mod tray;
+pub mod window_shape;
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{

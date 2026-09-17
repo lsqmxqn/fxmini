@@ -84,6 +84,7 @@ use crate::engine::{EngineHandle, EngineStatus, SharedParams, MAX_BANDS, SPECTRU
 use crate::i18n::{self, PanelText};
 use crate::preset::PresetEntry;
 use crate::ui::theme::{self, radius, space, Palette};
+use crate::ui::window_shape::RoundedWindow;
 
 /// Set while a panel window exists, so a second tray click focuses the existing
 /// one instead of opening another.
@@ -242,7 +243,32 @@ const EFFECTS: [EffectSlot; 5] = [
 ];
 
 /// Band counts the engine accepts.
-const BAND_CHOICES: [usize; 5] = [5, 10, 15, 20, 31];
+///
+/// Five and ten only. The engine does take 15, 20 and 31 — `GraphicEqSetNumBands`
+/// validates 1..31 — but nothing upstream publishes frequencies for them: the
+/// band editors come up blank and dragging a node does nothing, because
+/// [`eq_curve`] draws no curve at all until the engine has published a
+/// frequency for every band. Offering a choice that leads to an empty plot is
+/// worse than not offering it, so the list stops at ten.
+const BAND_CHOICES: [usize; 2] = [5, 10];
+
+/// Vertical padding inside a preset row, in points.
+///
+/// The rows are butted together — [`PanelApp::preset_card`] zeroes
+/// `item_spacing.y` inside the popup — so this is the whole gap between two
+/// rows' text. Five points is egui's button padding; the extra three replace the
+/// gap egui would otherwise have left *between* the rows. Moving it inside the
+/// row is what lets the hover highlight cover the full pitch. Left outside, the
+/// pointer crosses a strip where no row is highlighted, and the highlight blinks
+/// on and off as the mouse is swept down the list — a menu row is the full
+/// pitch, not the text plus air.
+const PRESET_ROW_PAD_Y: f32 = 8.0;
+
+/// How many presets the popup shows before it starts scrolling.
+///
+/// The shipped folder holds seventeen, so this always scrolls. Eight rows keep
+/// the popup short enough to clear the bottom of a 620-point window.
+const PRESET_ROWS_VISIBLE: usize = 8;
 
 /// Width of the label column in the effect and output rows.
 ///
@@ -473,6 +499,118 @@ fn fitted_height(content: f32, chrome: f32, monitor: Option<f32>) -> f32 {
     capped.max(MIN_PANEL_HEIGHT)
 }
 
+/// Text laid out to measure a row.
+///
+/// Any row's text would do: a galley's height comes from the font family's
+/// metrics, not from the glyphs in it. It reads a Latin ascender and descender
+/// plus ideographs anyway, so that it stays representative if a row ever starts
+/// being sized by what it contains — the list mixes the two scripts, and the
+/// Chinese presets are the ones a shorter sample would understate.
+const ROW_SAMPLE: &str = "Ag低音增";
+
+/// The height of one popup row, in points.
+///
+/// The row's frame is what decides this, and `Frame::total_margin` sums three
+/// things — inner margin, stroke width, outer margin — which for a button comes
+/// to `spacing.button_padding` exactly: `Style::button_style` sets the inner
+/// margin to `button_padding + expansion - stroke.width` and the stroke puts
+/// that width back, and every widget state egui ships has `expansion` at zero.
+/// `AtomLayout::allocate` then raises the whole thing to `min_size`, which
+/// `Button` has already set to `interact_size.y`; so does the `max` below.
+///
+/// Two things here are load-bearing and neither is obvious.
+///
+/// [`PRESET_ROW_PAD_Y`], not `ui.spacing().button_padding.y`: the popup's
+/// spacing is overridden inside `ComboBox::show_ui`, so the `ui` this is called
+/// on still carries the panel's ordinary button padding. Reading it there gave
+/// five instead of eight, and a viewport 48 points shorter than the eight rows
+/// it claimed to hold.
+///
+/// And the frame has to be forced on. `Button::selectable` sets
+/// `frame_when_inactive(false)`, which hands an unselected row a frame with no
+/// stroke at all — `Frame::new()`, not the button style's — and the stroke is
+/// part of the margin, so a row the pointer is *not* over comes out two points
+/// shorter than one it is. Everything below a hovered row then slides by two
+/// points as the pointer travels down the list, which is what the presets read
+/// as: rows jumping about. [`preset_row`] is where that is dealt with, and this
+/// function describes the height only because that is how the rows are built.
+///
+/// The text height comes from laying out [`ROW_SAMPLE`], not from
+/// [`egui::Ui::text_style_height`]. That function reports the *font's* line
+/// height, and the CJK face this panel installs has far taller metrics than the
+/// Latin text most presets are named in: asking for eight rows through it
+/// yielded eleven. Laying the sample out gives the height the row widget is
+/// actually built from, which is what has to be multiplied.
+fn preset_row_height(ui: &egui::Ui) -> f32 {
+    let style = ui.style();
+    let font = egui::TextStyle::Button.resolve(style);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(ROW_SAMPLE.to_owned(), font, egui::Color32::PLACEHOLDER);
+    (galley.size().y + 2.0 * PRESET_ROW_PAD_Y).max(style.spacing.interact_size.y)
+}
+
+/// One row of the preset popup.
+///
+/// Exists so that the row the tests measure is the row that ships, rather than
+/// a lookalike assembled from the same parts — the two numbers this has to
+/// agree with, [`preset_row_height`] and [`preset_popup_height`], are otherwise
+/// checked against a copy of the widget rather than against the widget.
+///
+/// `frame_when_inactive(true)` is the point of it. See [`preset_row_height`]:
+/// left at the default, the frame is dropped for a row that is neither selected
+/// nor hovered, and with the frame goes the border that makes the row 31 points
+/// tall instead of 29. Forcing it on gives every row the same frame and so the
+/// same height, whatever the pointer is doing.
+fn preset_row(selected: bool, name: &str) -> egui::Button<'_> {
+    egui::Button::selectable(selected, name).frame_when_inactive(true)
+}
+
+/// Puts the popup into the state its row height assumes.
+///
+/// One function rather than three lines inline, because the row height is only
+/// the row height under *these* settings — the padding below is what
+/// [`preset_row_height`] is written against — and the test has to measure the
+/// popup that ships rather than a reconstruction of it.
+fn preset_popup_ui(ui: &mut egui::Ui) {
+    // Butted together where egui would leave `item_spacing.y` between them; see
+    // `PRESET_ROW_PAD_Y`. Without this the highlight is shorter than the row
+    // pitch and disappears in the gap between two rows.
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.spacing_mut().button_padding.y = PRESET_ROW_PAD_Y;
+
+    // With the frame forced on by `preset_row`, an unselected row would paint
+    // the theme's button background and outline — seventeen outlined boxes
+    // stacked in a menu. The frame still has to be *there*, because its margins
+    // are what make the row tall enough for the highlight to cover it, so it is
+    // made invisible rather than dropped: the fill goes transparent, and the
+    // border keeps its width and loses its colour.
+    //
+    // Neither touches the selected row: `Style::button_style` overrides
+    // `weak_bg_fill` from `visuals.selection` whenever the button carries the
+    // selected class, so the accent fill is drawn as before.
+    let widgets = &mut ui.visuals_mut().widgets;
+    widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
+    widgets.inactive.bg_stroke.color = egui::Color32::TRANSPARENT;
+    widgets.hovered.bg_stroke.color = egui::Color32::TRANSPARENT;
+    widgets.active.bg_stroke.color = egui::Color32::TRANSPARENT;
+}
+
+/// The height of the preset popup's scroll viewport, in points.
+///
+/// A whole number of [`PRESET_ROWS_VISIBLE`] rows, so the viewport edge lands
+/// on a row boundary and no row is left clipped. egui's own default is a flat
+/// [`egui::Spacing::combo_height`] (200), which is not a multiple of any row
+/// height — against this panel's 31-point rows it fits six and leaves the
+/// seventh as a sliver at the bottom edge.
+///
+/// `ComboBox::height` caps the scroll area and the popup's own frame margin is
+/// added outside it, so this is the viewport exactly and needs no allowance for
+/// the border.
+fn preset_popup_height(ui: &egui::Ui) -> f32 {
+    preset_row_height(ui) * PRESET_ROWS_VISIBLE as f32
+}
+
 struct PanelApp {
     shared: PanelShared,
     spectrum: Vec<f32>,
@@ -494,6 +632,11 @@ struct PanelApp {
     /// Once only. After that the size belongs to whoever dragged the frame, and
     /// re-imposing a computed one would undo their choice.
     fitted: bool,
+    /// Cuts the window's corners round, once per window size.
+    ///
+    /// Windows 10 does not round a top-level window the way Windows 11 does, so
+    /// the shape has to be imposed from here. See [`crate::ui::window_shape`].
+    shape: RoundedWindow,
 }
 
 impl PanelApp {
@@ -509,6 +652,7 @@ impl PanelApp {
             eq_dragging: None,
             eq_selected: None,
             fitted: false,
+            shape: RoundedWindow::new(),
         }
     }
 
@@ -705,8 +849,16 @@ fn is_a_usable_filename(name: &str) -> bool {
 }
 
 impl eframe::App for PanelApp {
-    fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut eframe::egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+
+        // Before anything is laid out, so the frame about to be presented is
+        // already clipped. A region applies to the window rather than to a
+        // frame, so doing this at the end of the pass would round the *next*
+        // frame instead — and on a panel that only redraws while something is
+        // moving, that is a square-cornered flash on open.
+        self.shape
+            .apply(frame, ctx.pixels_per_point(), radius::CARD as f32);
 
         // A save that finished since the last frame, or a preset folder that
         // changed. Done first so the combo box and the footer below both see
@@ -898,10 +1050,20 @@ impl PanelApp {
             egui::ComboBox::from_id_salt("preset-combo")
                 .selected_text(current)
                 .width(ui.available_width())
+                // A whole number of rows, instead of egui's flat 200-point cap.
+                // Seventeen presets at the row pitch above run to 527 points, so
+                // the list scrolls either way — but at a flat cap the viewport
+                // ends mid-row, with the next preset left as a sliver at the
+                // bottom edge. Scrolling then parks the list at an arbitrary
+                // pixel offset, so a part-row sits at the top or bottom of the
+                // frame depending on where the wheel stopped.
+                .height(preset_popup_height(ui))
                 .show_ui(ui, |ui| {
+                    preset_popup_ui(ui);
+
                     for entry in &self.shared.presets {
                         let selected = active.as_ref().is_some_and(|path| path == &entry.path);
-                        if ui.selectable_label(selected, &entry.name).clicked() {
+                        if ui.add(preset_row(selected, entry.name.as_str())).clicked() {
                             chosen = Some(entry.path.clone());
                         }
                     }
@@ -1805,6 +1967,110 @@ mod tests {
         assert_eq!(fitted_height(600.0, 190.0, Some(300.0)), MIN_PANEL_HEIGHT);
     }
 
+    /// The preset popup holds a whole number of rows, and no row changes height.
+    ///
+    /// Two things have to hold for the list to stop reading as "the rows jump
+    /// about", and this pins both.
+    ///
+    /// The cap has to be an exact multiple of the row height, or the list ends
+    /// mid-row with a part-row at the bottom edge that moves as it scrolls. The
+    /// row height is arithmetic over the font metrics and over a padding
+    /// constant the popup sets *after* the cap has already been asked for, and
+    /// the two can drift apart with nothing to catch it — which is what happened
+    /// once already: the padding was read from the enclosing `ui` instead of
+    /// from the popup, and the cap came out 48 points short of the eight rows it
+    /// claimed.
+    ///
+    /// And a row has to be the same height whether or not the pointer is on it.
+    /// `Button::selectable` sets `frame_when_inactive(false)`, and `Button`
+    /// drops the frame for a row that is neither selected nor hovered — with the
+    /// frame goes its border, which is part of the row's height. Plain rows came
+    /// out 29 points against 31 for the row under the pointer, so everything
+    /// below the pointer slid by two points as it travelled down the list. That
+    /// is the more visible half of the symptom and the reason the third frame
+    /// below exists: it parks the pointer on a row and measures it again.
+    ///
+    /// Runs headless — real frames, laid out and never painted.
+    #[test]
+    fn the_preset_popup_ends_on_a_row_boundary() {
+        let ctx = egui::Context::default();
+        install_cjk_font(&ctx);
+        theme::apply(&ctx);
+
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(360.0, 640.0),
+            )),
+            events,
+            ..Default::default()
+        };
+
+        let mut plain = 0.0f32;
+        let mut selected = 0.0f32;
+        let mut row = 0.0f32;
+        let mut popup = 0.0f32;
+        let mut first_row = egui::Rect::NOTHING;
+
+        let _ = ctx.run_ui(input(Vec::new()), |ui| {
+            preset_popup_ui(ui);
+
+            let response = ui.add(preset_row(false, "Classical"));
+            plain = response.rect.height();
+            first_row = response.rect;
+            selected = ui.add(preset_row(true, "Jazz")).rect.height();
+
+            row = preset_row_height(ui);
+            popup = preset_popup_height(ui);
+        });
+
+        assert!(plain > 0.0, "the rows did not lay out at all");
+        assert_eq!(
+            row, plain,
+            "the predicted row height is not the height a row lays out at",
+        );
+        assert_eq!(
+            popup,
+            plain * PRESET_ROWS_VISIBLE as f32,
+            "the popup is {popup} points, which is not {PRESET_ROWS_VISIBLE} rows of {plain}",
+        );
+        assert_eq!(
+            plain, selected,
+            "a plain row is {plain} points and the selected one {selected}",
+        );
+
+        // Now with the pointer on that first row. The layout either side of the
+        // pointer has to be untouched by it, so the row is the same height it
+        // was and the rows below it have not moved.
+        let mut hovering = 0.0f32;
+        let mut under = 0.0f32;
+        let mut hovered = false;
+
+        let _ = ctx.run_ui(
+            input(vec![egui::Event::PointerMoved(first_row.center())]),
+            |ui| {
+                preset_popup_ui(ui);
+
+                let response = ui.add(preset_row(false, "Classical"));
+                hovered = response.hovered();
+                hovering = response.rect.height();
+                under = ui.add(preset_row(false, "Classic Rock")).rect.top();
+            },
+        );
+
+        assert!(hovered, "the pointer did not land on a row, so nothing was measured");
+        assert_eq!(
+            hovering, plain,
+            "the row under the pointer is {hovering} points and the others {plain}",
+        );
+        assert_eq!(
+            under,
+            first_row.bottom(),
+            "the row below a hovered row starts at {under}, not {}",
+            first_row.bottom(),
+        );
+    }
+
     /// Holds the window open for a while, when asked to.
     ///
     /// The one thing about this panel that cannot be asserted from inside the
@@ -1842,6 +2108,32 @@ mod tests {
         (owner == std::process::id()).then_some(window)
     }
 
+    /// The names the shipped presets carry, as the test panel's list.
+    ///
+    /// The real folder holds seventeen of these, which is more than the combo's
+    /// popup can show at once — the case worth having in a fixture, because a
+    /// list that fits never scrolls and never exercises the popup's own scroll
+    /// area.
+    const PRESET_NAMES: [&str; 17] = [
+        "Alternative Rock",
+        "低音增强",
+        "Classic Rock",
+        "Classical",
+        "游戏",
+        "通用",
+        "Jazz",
+        "Metal",
+        "Modern Rock",
+        "电影",
+        "音乐",
+        "Pop",
+        "脚步增强",
+        "枪声压制",
+        "哈曼卡顿",
+        "R&B",
+        "Trap",
+    ];
+
     /// A panel's inputs, with nothing real behind them.
     ///
     /// The equalizer grid is seeded rather than left empty. A detached engine
@@ -1869,7 +2161,17 @@ mod tests {
             params: Arc::clone(handle.params()),
             status: Arc::clone(handle.status()),
             handle,
-            presets: Vec::new(),
+            // A list long enough to overflow the combo's popup, which is where
+            // the dropdown scrolls. An empty one would exercise the layout
+            // around the combo and none of the list inside it.
+            presets: PRESET_NAMES
+                .iter()
+                .map(|name| PresetEntry {
+                    name: (*name).to_owned(),
+                    path: PathBuf::from(format!("{name}.fac")),
+                    origin: crate::preset::PresetOrigin::BuiltIn,
+                })
+                .collect(),
         }
     }
 

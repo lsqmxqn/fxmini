@@ -703,6 +703,7 @@ dependencies = [
  "cc",
  "eframe",
  "log",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "simplelog",

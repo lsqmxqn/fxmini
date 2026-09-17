@@ -14,9 +14,14 @@
 //!    and fight over the default device.
 //! 4. Join the STA apartment and run the tray message loop.
 
-// No console window in release builds. Debug builds keep it so `cargo run`
-// shows the log inline.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// No console window, in any profile.
+//
+// Debug builds used to keep it, on the theory that `cargo run` should print the
+// log inline. That made the console a *debug-only* defect: a tray application
+// that opens a console window is wrong for the same reason in either profile,
+// and testing it in debug is exactly how it gets missed. The log is written to
+// `fxmini.log` by `init_logging` regardless, so nothing is lost.
+#![windows_subsystem = "windows"]
 
 use fxmini::device::ComGuard;
 use fxmini::{app, autostart, config, driver, routing, ui};
