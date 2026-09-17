@@ -294,9 +294,9 @@ package.ps1 -NoBuild                                   # 两项自检 + 出包
 ### 发版
 
 ```bash
-# Cargo.toml 与 Cargo.lock 里的 version 必须已经是 0.1.1（CI 用 --locked）
-git tag v0.1.1
-git push origin v0.1.1
+# Cargo.toml 与 Cargo.lock 里的 version 必须已经是本次要发的版本（CI 用 --locked）
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
 [`.github/workflows/release.yml`](.github/workflows/release.yml) 会打包并创建 Release，附上 zip 与 `SHA256SUMS.txt`。标签与 `Cargo.toml` 版本不一致时工作流**直接失败**：产物的文件名来自版本号，而人们引用的是标签，两者不能漂移。
@@ -434,6 +434,14 @@ FxMini 不重复造轮子，声音与驱动都来自上游：
 ---
 
 ## 版本历史
+
+### 0.1.2
+
+- **调音面板加圆角**：Windows 10 没有 DWM 圆角 API，所以面板自己裁窗口区域（新增 `src/ui/window_shape.rs`，`GetWindowRect` + `CreateRoundRectRgn` + `SetWindowRgn`）。裁的是**窗口矩形**而不是客户区——按客户区裁会留下一圈仍然方角的边框。托盘菜单按 Windows 惯例保持方形。
+- **修掉预设下拉的「跳动」**：行高原先会随指针移动而变化。egui 对「既未选中也未悬停」的行会丢掉 `Frame`，而描边是 `Frame` 度量的一部分，于是那一行在 **29 pt 与 31 pt** 之间切换，**它以下的每一行都跟着位移 2 pt**。现在每行都强制走带 `Frame` 的路径，再把 `Frame` 做成不可见：填充透明、描边**保留宽度只去掉颜色**（宽度就是行高，动不得）。
+- **下拉视口改成整数行**：原先用 egui 默认的 200 pt 上限，装不满 8 行，底部留一条被裁剩的残行；滚动之后残行停在边缘，是「跳动」观感的另一半来源。现在视口 = 8 × 实测行高（248 pt），并且内边距从常量读，而不是从弹层**外面**那个 `ui` 读——后者当年算出 5 而不是 8，视口比它自称的 8 行短了 48 pt。
+- **频段选项只留 5 与 10**：引擎本身接受 1..31，但上游只为 5 / 10 发布了频点，选 15 / 20 / 31 时 `eq_curve` 拿不到频率就**故意不画**——点了一定得到空曲线。与其留一个点了就空白的选项，不如去掉。
+- **debug 构建不再弹黑色控制台窗口**：`windows_subsystem = "windows"` 原先只在 release 生效，于是控制台成了「只在 debug 存在的缺陷」，而 debug 恰恰是唯一会去看它的场合。日志本来就写文件（`init_logging`），不依赖控制台。
 
 ### 0.1.1
 
