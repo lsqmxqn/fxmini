@@ -935,9 +935,14 @@ impl eframe::App for PanelApp {
         // width: its buttons have to reach the window's corners, so it cannot be
         // inside anything with a margin. The surface colour is the same one the
         // header below uses, which is what makes the two read as one top band
-        // rather than two stacked bars.
+        // rather than two stacked bars — and that is also why egui's own
+        // separator line is off. A panel draws one by default
+        // ([`egui::containers::panel::Panel::show_separator_line`]), and it would
+        // run a one-point line in the *widget* stroke colour straight across the
+        // window between two fills that are deliberately the same.
         let caption_height = egui::Panel::top("caption")
             .exact_size(window_chrome::CAPTION_HEIGHT)
+            .show_separator_line(false)
             .frame(egui::Frame::default().fill(palette.surface))
             .show(ui, |ui| window_chrome::caption(ui, palette))
             .response
@@ -947,7 +952,12 @@ impl eframe::App for PanelApp {
         // The rest of the panels are measured as they are built, because how
         // tall the window has to be is "the cards, plus whatever the chrome
         // took" — and only egui knows that.
+        //
+        // No separator line below this one either: the header and the caption
+        // are one white band, and the first thing that should break it is the
+        // central panel's grey field.
         let header_height = egui::Panel::top("header")
+            .show_separator_line(false)
             .frame(
                 egui::Frame::default()
                     .fill(palette.surface)
@@ -962,7 +972,12 @@ impl eframe::App for PanelApp {
 
         // The footer is where a save happens: it is the one part of the window
         // that is always on screen, so "tune, then save" never needs a scroll.
+        //
+        // No separator line: the footer's card already has a border, and the
+        // panel's own line would draw a second one immediately above it, across
+        // the grey field where nothing else is horizontal.
         let footer_height = egui::Panel::bottom("footer")
+            .show_separator_line(false)
             .frame(
                 egui::Frame::default()
                     .fill(palette.surface)

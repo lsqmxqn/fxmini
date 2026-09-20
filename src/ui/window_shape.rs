@@ -36,6 +36,49 @@
 //! The tray menu is deliberately *not* rounded. It is a Win32 popup menu drawn
 //! by the system, and the one hook that could have caught its first frame
 //! (`EVENT_SYSTEM_MENUPOPUPSTART`) is delivered after the menu is already up.
+//!
+//! ## The one-pixel strip along the top and left
+//!
+//! An undecorated window here used to show a two-to-three pixel band of grey
+//! along its top and left edges. It was not the panel's own drawing: three
+//! separate things stacked up, and only the first was ours.
+//!
+//! **The client rectangle is one pixel lower than the window.** egui-winit asks
+//! for an undecorated drop shadow whenever the decorations are off
+//! (`egui-winit-0.35.0/src/lib.rs`: `with_undecorated_shadow(!decorations…)`),
+//! and winit answers that marker by moving the client rectangle down to leave
+//! room for the shadow:
+//!
+//! ```text
+//! } else if window_flags.contains(WindowFlags::MARKER_UNDECORATED_SHADOW) {
+//!     params.rgrc[0].top += 1;
+//!     params.rgrc[0].bottom += 1;
+//! }
+//! ```
+//!
+//! So the topmost pixel belongs to the non-client area, egui never paints there,
+//! and what Windows leaves behind is a neutral grey row (`(227, 227, 227)` on the
+//! light theme — a colour in no palette). [`RoundedWindow::clear_window_edge`]
+//! calls `set_undecorated_shadow(false)`, which is the supported way to say the
+//! same thing, and the shift goes away.
+//!
+//! **`WS_EX_WINDOWEDGE` is left set by winit.** `WindowState::window_flags`
+//! starts `style_ex` at `WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES`, and the line that
+//! takes it off again sits *inside* the `WindowFlags::CHILD` branch, so a
+//! top-level undecorated window never reaches it. That flag asks the system to
+//! paint a raised edge around the client area — the left-hand column of the same
+//! strip. Clearing it through `GWL_EXSTYLE` does **not** work: the write is
+//! accepted (`SetWindowLongPtrW` returns the old value with no error) and the
+//! re-read shows the flag back, because Windows re-derives it as part of the
+//! frame. With the shadow off, the one-pixel client inset is gone and the edge
+//! the flag draws is covered by the panel's own fill, so it is left alone rather
+//! than fought.
+//!
+//! **The panel's own hairline was drawn half a pixel in.** `shrink(0.5)` with
+//! `StrokeKind::Inside` puts a one-point stroke across `[0.5, 1.5]`, so pixel 0
+//! held bare panel fill and the line was feathered over two pixels. See
+//! [`super::window_chrome::outline`], which now snaps the stroke onto the
+//! outermost pixel instead.
 
 use raw_window_handle::{HasWindowHandle as _, RawWindowHandle};
 use std::ffi::c_void;
@@ -61,6 +104,12 @@ pub struct RoundedWindow {
     /// `None` means no region is in force: either none has been cut yet, or the
     /// one that was has been cleared because the window is maximised.
     applied: Option<(i32, i32)>,
+    /// Whether the undecorated drop shadow has been turned off yet.
+    ///
+    /// Stateful because `set_undecorated_shadow` re-runs `WM_NCCALCSIZE`, and
+    /// there is no reason to shift the client rectangle back and forth every
+    /// frame to ask for the same answer.
+    shadow_off: bool,
 }
 
 impl RoundedWindow {
@@ -87,6 +136,13 @@ impl RoundedWindow {
         let Some(window) = self.window(frame) else {
             return;
         };
+
+        // Before the region, because turning the shadow off changes the client
+        // rectangle, and the region is cut from the window rectangle the new
+        // geometry settles on.
+        if !self.shadow_off {
+            self.shadow_off = clear_undecorated_shadow(frame);
+        }
 
         if maximized {
             if self.applied.is_some() {
@@ -161,6 +217,49 @@ impl RoundedWindow {
 
         self.hwnd
     }
+}
+
+/// Turns the undecorated drop shadow off, which is what removes the window's
+/// one-pixel top strip. Returns whether it had a window to do it to.
+///
+/// See the module docs for the whole chain. The short version: egui-winit sets
+/// `WindowAttributesExtWindows::with_undecorated_shadow(true)` whenever the
+/// decorations are off (`egui-winit-0.35.0/src/lib.rs`, `create_window`), and
+/// winit answers that marker by shifting the client rectangle **down one pixel**
+/// to leave room for the shadow it is adding:
+///
+/// ```text
+/// } else if window_flags.contains(WindowFlags::MARKER_UNDECORATED_SHADOW) {
+///     params.rgrc[0].top += 1;
+///     params.rgrc[0].bottom += 1;
+/// }
+/// ```
+///
+/// The pixel that shift gives up is not part of the client area, so egui never
+/// paints on it — and what Windows leaves there, on this build, is that neutral
+/// grey row. Together with the panel's own hairline it is the strip that gets
+/// reported as "two to three pixels along the left and top".
+///
+/// The shadow being given up is worth nothing here anyway: an undecorated
+/// window clipped by `SetWindowRgn` is not rounded by the DWM on Windows 10, so
+/// the shadow that ships with the one-pixel inset arrives clipped to our own
+/// rectangle and is barely visible. [`super::window_chrome::outline`] is the edge
+/// the user actually sees.
+///
+/// Done once. Unlike the window style, this is not something winit re-derives
+/// behind our back: it is set when the window is created and again only if
+/// `ViewportCommand::Decorations` arrives, which this app never sends.
+fn clear_undecorated_shadow(frame: &eframe::Frame) -> bool {
+    use winit::platform::windows::WindowExtWindows as _;
+
+    let Some(window) = frame.winit_window() else {
+        // Headless, or a backend with no winit window. False rather than true, so
+        // a later frame tries again.
+        return false;
+    };
+
+    window.set_undecorated_shadow(false);
+    true
 }
 
 /// A length in points, as whole physical pixels, never zero.

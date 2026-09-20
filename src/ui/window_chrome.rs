@@ -105,6 +105,9 @@ const GLYPH_STROKE: f32 = 1.0;
 /// caption's corners still behave like buttons.
 const EDGE: f32 = 5.0;
 
+/// How thick the window's own edge is, in points. See [`outline`].
+const STROKE: f32 = 1.0;
+
 /// The close button's fill under the pointer.
 ///
 /// Not [`Palette::danger`], and deliberately not per-theme. This red is a
@@ -490,14 +493,30 @@ fn cursor(direction: ResizeDirection) -> CursorIcon {
 /// The radius is the one [`super::window_shape`] cuts out of the window; if the
 /// two ever disagreed, the edge would either float inside the corner or be
 /// clipped by it.
+///
+/// ## Why the rectangle is snapped rather than shrunk
+///
+/// This used to be `viewport_rect().shrink(0.5)` with [`StrokeKind::Inside`],
+/// which covers the span `[0.5, 1.5]` points. At 100 % scaling that straddles
+/// two physical pixels, and — worse — it leaves pixel 0 covered by nothing but
+/// the panel's own fill. The seam between that one-pixel band of fill and the
+/// hairline beside it *is* visible: on the left and top edges it reads as a two
+/// to three pixel strip, because the fill gap and the feathered line are
+/// different colours sitting next to each other.
+///
+/// The stroke is instead placed so that it exactly covers the window's outermost
+/// physical pixel: the rectangle is snapped outward to a whole pixel, and then
+/// shrunk by half a stroke *in pixels*, so `[0, 1]` in physical pixels is the
+/// stroke and nothing of the panel's fill survives outside it. See [`edge_rect`].
 pub fn outline(ctx: &egui::Context, palette: &Palette, maximized: bool) {
     if maximized {
         return;
     }
 
-    // Half a point in, so the hairline is drawn inside the window rather than
-    // half outside it — the outer half would be cut off by the window region.
-    let rect = ctx.input(|input| input.viewport_rect()).shrink(0.5);
+    let (rect, pixels_per_point) = ctx.input(|input| {
+        (input.viewport_rect(), input.pixels_per_point())
+    });
+    let rect = edge_rect(rect, STROKE, pixels_per_point);
 
     ctx.layer_painter(egui::LayerId::new(
         Order::Foreground,
@@ -506,9 +525,48 @@ pub fn outline(ctx: &egui::Context, palette: &Palette, maximized: bool) {
     .rect_stroke(
         rect,
         CornerRadius::same(theme::radius::CARD),
-        Stroke::new(1.0, palette.border_strong),
+        Stroke::new(STROKE, palette.border_strong),
         StrokeKind::Inside,
     );
+}
+
+/// The rectangle whose [`StrokeKind::Inside`] stroke lands exactly on the
+/// window's outermost physical pixel.
+///
+/// Two steps, and the order matters:
+///
+/// * The viewport's own edges are rounded to whole physical pixels. egui's
+///   rectangles are in points and a window is in pixels; at a fractional scale
+///   (`pixels_per_point = 1.25`) the two disagree, and an unsnapped edge lands
+///   partway through a pixel and is feathered across two.
+/// * Then half a stroke is taken off each side, still in pixels, so the stroke —
+///   which [`StrokeKind::Inside`] draws inward from the rectangle — occupies
+///   `[0, 1]` rather than `[0.5, 1.5]`.
+///
+/// The half-stroke offset is deliberately applied *after* the snap and not
+/// snapped again: `snap(v + half) - half` is not `snap(v)` when `half` is 0.5,
+/// because rounding 0.5 goes up and the two errors do not cancel. Snapping the
+/// viewport edge and then offsetting in pixels keeps the stroke's outer edge on
+/// the pixel boundary it was snapped to.
+///
+/// The result is the rectangle to hand to `rect_stroke`, not the edge's
+/// footprint: the stroke drawn inside this rectangle is the footprint.
+fn edge_rect(viewport: Rect, stroke: f32, pixels_per_point: f32) -> Rect {
+    let scale = if pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    };
+    let half = stroke / 2.0;
+
+    // Points -> pixels, snap to a whole pixel, pixels -> points.
+    let snap = |value: f32| (value * scale).round() / scale;
+
+    Rect::from_min_max(
+        Pos2::new(snap(viewport.left()), snap(viewport.top())),
+        Pos2::new(snap(viewport.right()), snap(viewport.bottom())),
+    )
+    .shrink(half)
 }
 
 #[cfg(test)]
@@ -819,5 +877,107 @@ mod tests {
                 .all(|command| !matches!(command, ViewportCommand::BeginResize(_))),
             "a maximised window still offered a resize: {commands:?}"
         );
+    }
+
+    /// The outline's stroke must cover the window's outermost physical pixel and
+    /// nothing else.
+    ///
+    /// This is the regression test for the two-to-three pixel strip along the
+    /// left and top edges. The old `shrink(0.5)` put the stroke at `[0.5, 1.5]`,
+    /// which left pixel 0 as bare panel fill and feathered the line over pixels
+    /// 1 and 2. Asserting on the *footprint* — the rectangle the stroke covers —
+    /// is what makes this a test of the pixels rather than of the arithmetic.
+    #[test]
+    fn the_outline_covers_the_outermost_pixel_and_no_more() {
+        let viewport = window();
+
+        for scale in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+            let rect = edge_rect(viewport, STROKE, scale);
+            let rect = rect.expand(STROKE / 2.0); // StrokeKind::Inside -> the footprint
+
+            // The footprint starts on the window's edge, to within a pixel.
+            for (edge, found, wanted) in [
+                ("left", rect.left(), viewport.left()),
+                ("top", rect.top(), viewport.top()),
+                ("right", rect.right(), viewport.right()),
+                ("bottom", rect.bottom(), viewport.bottom()),
+            ] {
+                let error_px = (found - wanted).abs() * scale;
+                assert!(
+                    error_px < 0.5,
+                    "at {scale}x the {edge} of the outline is {error_px:.2} px off the \
+                     window edge, so the edge pixel is not fully covered"
+                );
+            }
+
+            // And it is exactly one point thick — which is one physical pixel at
+            // 100 % scaling and proportionally more above it. A system border
+            // scales with the display in the same way, so the assertion is on
+            // the point thickness and not on a pixel count.
+            for (edge, span) in [
+                ("left", (rect.left(), rect.left() + STROKE)),
+                ("top", (rect.top(), rect.top() + STROKE)),
+            ] {
+                let points = span.1 - span.0;
+                assert!(
+                    (points - STROKE).abs() < f32::EPSILON,
+                    "at {scale}x the {edge} stroke is {points} points, not {STROKE}"
+                );
+                // At 100 % that is one pixel; the tests above are what keep it
+                // on the outermost one.
+                if scale == 1.0 {
+                    assert!(
+                        (points * scale - 1.0).abs() < 0.5,
+                        "at 1x the {edge} stroke covers {points} px, not one"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The snapped rectangle stays inside the window, at every scale.
+    ///
+    /// The snap rounds both edges by the same rule, so a window an odd number of
+    /// pixels wide keeps its width rather than growing one — which matters
+    /// because the stroke is drawn *inside* this rectangle and anything outside
+    /// the window would be cut off by the window region.
+    #[test]
+    fn the_outline_never_escapes_the_window() {
+        for width in [400.0_f32, 401.0, 660.0, 661.0, 1024.0] {
+            let viewport = Rect::from_min_size(Pos2::new(30.0, 70.0), Vec2::new(width, 820.0));
+
+            for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+                let rect = edge_rect(viewport, STROKE, scale);
+
+                assert!(
+                    viewport.contains_rect(rect),
+                    "at {scale}x and {width} wide, {rect:?} escapes {viewport:?}"
+                );
+                // The footprint, which is what is actually painted.
+                let footprint = rect.expand(STROKE / 2.0);
+                let slack = 0.5 / scale;
+                assert!(
+                    footprint.left() >= viewport.left() - slack
+                        && footprint.top() >= viewport.top() - slack
+                        && footprint.right() <= viewport.right() + slack
+                        && footprint.bottom() <= viewport.bottom() + slack,
+                    "at {scale}x the painted outline {footprint:?} is off the window"
+                );
+            }
+        }
+    }
+
+    /// A degenerate scale must not produce a NaN or inverted rectangle.
+    #[test]
+    fn the_outline_survives_a_useless_scale() {
+        let viewport = window();
+
+        for scale in [0.0_f32, -1.0] {
+            let rect = edge_rect(viewport, STROKE, scale);
+
+            assert!(rect.width() > 0.0 && rect.height() > 0.0, "{rect:?}");
+            assert!(rect.is_finite(), "{rect:?}");
+            assert!(viewport.contains_rect(rect), "{rect:?}");
+        }
     }
 }
