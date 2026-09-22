@@ -420,7 +420,14 @@ impl App {
     /// The panel needs none of this: it re-reads the string table each frame,
     /// so an open panel changes language on its next repaint.
     fn set_language(&mut self, language: Lang) {
+        // Picking the language that is already in force is a no-op for the
+        // translation, but not for the menu: Windows toggles a checkmark on the
+        // click *before* the application sees the event, so clicking the ticked
+        // entry has just cleared its own tick. Re-assert the ticks and return —
+        // there is nothing else to redo, and no reason to write the config
+        // again.
         if language == i18n::current() {
+            self.tray.refresh_language_ticks();
             return;
         }
 

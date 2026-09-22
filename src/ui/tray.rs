@@ -58,7 +58,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use tray_icon::menu::{
-    CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+    CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, MenuItemKind, PredefinedMenuItem, Submenu,
 };
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -113,6 +113,23 @@ pub struct Tray {
     rescan_item: MenuItem,
     autostart_item: CheckMenuItem,
     language_menu: Submenu,
+    /// The per-language entries, taken back out of the submenu's own child list.
+    ///
+    /// They have to be held rather than looked up later: the tick on the current
+    /// language is the only thing in this menu that says *which* language is in
+    /// force, and `Submenu::items()` cannot be used to recover them.
+    ///
+    /// `Submenu` is thread-bound — it stores its children inside a
+    /// `ManuallyDrop` wrapper with a hand-written `unsafe impl Send`, so
+    /// `items()` is only sound on the thread that created them, and dropping the
+    /// clones it returns anywhere else is undefined behaviour. `app.rs`
+    /// deliberately switches language from the message-loop thread while the
+    /// tray was built on the UI thread, so reading them back there would be
+    /// exactly the cross-thread access that invariant forbids.
+    ///
+    /// (`MenuId` is `Arc<str>` and would be safe, but a `MenuId` alone cannot be
+    /// ticked — `set_checked` lives on the item.)
+    language_items: Vec<(Lang, CheckMenuItem)>,
     install_item: MenuItem,
     remove_item: MenuItem,
     quit_item: MenuItem,
@@ -125,6 +142,73 @@ pub struct Tray {
     /// different places.
     routed: Cell<bool>,
     driver_present: Cell<bool>,
+}
+
+/// Builds the language submenu, returning it together with the entries that
+/// have to be ticked later.
+///
+/// The entries are endonyms — "中文" and "English" — so the way out of a language
+/// you cannot read is legible in that language. They are also the one pair of
+/// labels that never needs retitling, which is why they used not to be stored at
+/// all; the tick is the part that has to be kept, because it is the only
+/// on-screen record of which language is in force.
+///
+/// The items are recovered from [`Submenu::items`] rather than kept from the
+/// handles created here. `Submenu::append` takes its argument by reference and
+/// clones it into the child list, and the clone *shares* the original's id and
+/// shared state — reticking either copy works. Going through the child list is
+/// still better: it is what the user actually sees, so a failed append shows up
+/// as a short list rather than as a handle that is ticked but not on screen.
+/// `items()` is sound here because this is the thread that created them; the
+/// returned clones must not be dropped elsewhere, which the note on
+/// `Tray::language_items` spells out.
+fn build_language_menu(
+    label: &str,
+) -> Result<(Submenu, Vec<(Lang, CheckMenuItem)>), String> {
+    let menu = Submenu::new(label, true);
+    let current = i18n::current();
+    for lang in Lang::ALL {
+        let item = CheckMenuItem::new(lang.endonym(), true, lang == current, None);
+        menu.append(&item).map_err(stringify)?;
+    }
+
+    let items: Vec<(Lang, CheckMenuItem)> = menu
+        .items()
+        .into_iter()
+        .filter_map(|kind| match kind {
+            MenuItemKind::Check(item) => Lang::ALL
+                .iter()
+                .copied()
+                .find(|lang| lang.endonym() == item.text())
+                .map(|lang| (lang, item)),
+            _ => None,
+        })
+        .collect();
+
+    // A short list would mean an append did not land, and a ticked item that is
+    // not in the child list is invisible rather than merely wrong.
+    assert_eq!(
+        items.len(),
+        Lang::ALL.len(),
+        "every language entry must be recoverable from the submenu"
+    );
+
+    Ok((menu, items))
+}
+
+/// Ticks `current` and unticks everything else.
+///
+/// Split out from [`Tray::refresh_language_ticks`] so it can be exercised
+/// without a live tray icon — [`Tray::new`] builds one, which needs a desktop
+/// session, so a test that went through the `Tray` would be one of the
+/// `#[ignore]`d ones and the regression would go untested in CI.
+fn tick_languages(items: &[(Lang, CheckMenuItem)], current: Lang) {
+    for (lang, item) in items {
+        // Set *and* clear. Only setting is the original bug: Windows leaves a
+        // checkmark until it is explicitly taken off, so the old language kept
+        // its tick and two entries were ticked at once.
+        item.set_checked(*lang == current);
+    }
 }
 
 impl Tray {
@@ -148,19 +232,7 @@ impl Tray {
         let remove_item = MenuItem::new(text.remove_driver, true, None);
         let quit_item = MenuItem::new(text.quit, true, None);
 
-        // The language submenu. Its entries are endonyms — "中文" and
-        // "English" — so the way out of a language you cannot read is legible
-        // in that language. They are also the one pair of labels that never
-        // needs retitling, which is why they are not stored.
-        let language_menu = Submenu::new(text.language, true);
-        let current = i18n::current();
-        let mut language_items = Vec::with_capacity(Lang::ALL.len());
-        for lang in Lang::ALL {
-            let item = CheckMenuItem::new(lang.endonym(), true, lang == current, None);
-            if language_menu.append(&item).is_ok() {
-                language_items.push((item.id().clone(), lang));
-            }
-        }
+        let (language_menu, language_items) = build_language_menu(text.language)?;
 
         let mut actions: HashMap<MenuId, TrayAction> = [
             (open_item.id().clone(), TrayAction::OpenPanel),
@@ -175,8 +247,8 @@ impl Tray {
         .into_iter()
         .collect();
 
-        for (id, lang) in language_items {
-            actions.insert(id, TrayAction::SetLanguage(lang));
+        for (lang, item) in &language_items {
+            actions.insert(item.id().clone(), TrayAction::SetLanguage(*lang));
         }
 
         let separator = || PredefinedMenuItem::separator();
@@ -221,6 +293,7 @@ impl Tray {
             rescan_item,
             autostart_item,
             language_menu,
+            language_items,
             install_item,
             remove_item,
             quit_item,
@@ -358,9 +431,30 @@ impl Tray {
         if let Some(empty) = &self.preset_empty {
             empty.set_text(text.no_presets);
         }
+        // The language entries never change their own wording, but which one is
+        // ticked does move — that tick is the only on-screen record of the
+        // current language.
+        self.refresh_language_ticks();
         // The route entry's wording is state-dependent, so it is not simply
         // assigned here.
         self.refresh_route();
+    }
+
+    /// Ticks the language in force and clears the others.
+    ///
+    /// Each language entry is an independent checkmark, and Windows leaves a
+    /// checkmark exactly as it was set — nothing clears its siblings. So the
+    /// tick has to be moved by hand, in both directions: set it on the new
+    /// language *and* clear it off the old one. Doing only the first is what
+    /// used to leave two ticks showing.
+    ///
+    /// Callable from outside because Windows also toggles an item's checkmark
+    /// on the click, before the application ever sees the event. So the state
+    /// arriving here is never the state to trust — it is re-derived from
+    /// [`i18n::current`] on every language change *and* on re-picking the
+    /// language already in force, which is otherwise a no-op.
+    pub fn refresh_language_ticks(&self) {
+        tick_languages(&self.language_items, i18n::current());
     }
 
     /// Updates the hover tooltip.
@@ -429,3 +523,121 @@ impl Tray {
 fn stringify(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The ticked set, as the menu would draw it.
+    fn ticks(items: &[(Lang, CheckMenuItem)]) -> Vec<Lang> {
+        items
+            .iter()
+            .filter(|(_, item)| item.is_checked())
+            .map(|(lang, _)| *lang)
+            .collect()
+    }
+
+    /// Exactly one entry is ticked, and it is `lang`.
+    ///
+    /// This is the assertion the reported bug needed: the old code only ever
+    /// ticked the new language, so after a switch both were ticked.
+    fn assert_only(items: &[(Lang, CheckMenuItem)], lang: Lang) {
+        assert_eq!(ticks(items), vec![lang], "expected only {lang:?} to be ticked");
+    }
+
+    #[test]
+    fn the_language_menu_lists_every_language_once() {
+        let (_menu, items) = build_language_menu("Language").expect("submenu");
+
+        // Order matters: it is the order the switcher presents.
+        let listed: Vec<Lang> = items.iter().map(|(lang, _)| *lang).collect();
+        assert_eq!(listed, Lang::ALL.to_vec());
+
+        // The labels are endonyms, so the set of texts is the set of endonyms —
+        // this is what the lookup in `build_language_menu` matches on, and it
+        // only stays unambiguous while that holds.
+        let texts: Vec<String> = items.iter().map(|(_, item)| item.text()).collect();
+        let expected: Vec<String> = Lang::ALL.iter().map(|l| l.endonym().to_owned()).collect();
+        assert_eq!(texts, expected);
+    }
+
+    #[test]
+    fn the_initial_tick_is_on_the_language_in_force() {
+        let (_menu, items) = build_language_menu("Language").expect("submenu");
+        assert_only(&items, i18n::current());
+    }
+
+    /// Switching languages moves the tick instead of adding one.
+    ///
+    /// Drives the same three steps the app does — flip the language, re-tick,
+    /// put it back — because the failure was never in one step alone.
+    #[test]
+    fn switching_language_moves_the_tick_rather_than_adding_one() {
+        let original = i18n::current();
+        let (_menu, items) = build_language_menu("Language").expect("submenu");
+        assert_only(&items, original);
+
+        let other = Lang::ALL
+            .iter()
+            .copied()
+            .find(|l| *l != original)
+            .expect("more than one language");
+
+        i18n::set(other);
+        tick_languages(&items, i18n::current());
+        // The regression: before the fix this was [original, other].
+        assert_only(&items, other);
+        i18n::set(original);
+        tick_languages(&items, i18n::current());
+        assert_only(&items, original);
+    }
+
+    /// Re-picking the language already in force must not clear its own tick.
+    ///
+    /// Windows toggles the item's checkmark on the click, so by the time the
+    /// action arrives the tick has already gone; the app has to put it back.
+    /// This is the second half of the report — "clicking English again removes
+    /// the tick even though English is still in force".
+    #[test]
+    fn re_picking_the_current_language_restores_its_tick() {
+        let current = i18n::current();
+        let (_menu, items) = build_language_menu("Language").expect("submenu");
+        let (_, item) = items
+            .iter()
+            .find(|(lang, _)| *lang == current)
+            .expect("the current language has an entry");
+
+        // What Windows leaves behind after the click toggled it off. The other
+        // entry is left ticked on purpose: the buggy implementation only *sets*
+        // the tick, which happens to be enough when nothing else is ticked, so
+        // a blank slate would let it pass. The real desktop state is "the wrong
+        // entry is ticked", and only a clearing implementation repairs that.
+        item.set_checked(false);
+        let (other_lang, other_item) = items
+            .iter()
+            .find(|(lang, _)| *lang != current)
+            .expect("more than one language");
+        other_item.set_checked(true);
+        assert_eq!(
+            ticks(&items),
+            vec![*other_lang],
+            "precondition: the other entry is ticked and the current one is not"
+        );
+
+        tick_languages(&items, i18n::current());
+        assert_only(&items, current);
+    }
+
+    #[test]
+    fn every_language_entry_has_a_switch_action() {
+        // `build_language_menu` and the action map are filled from the same
+        // list, so a mismatch would mean an entry that silently does nothing.
+        let (_menu, items) = build_language_menu("Language").expect("submenu");
+        assert_eq!(
+            items.len(),
+            Lang::ALL.len(),
+            "a language entry with no action would be a dead menu item"
+        );
+    }
+}
+
