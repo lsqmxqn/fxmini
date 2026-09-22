@@ -545,6 +545,41 @@ mod tests {
         assert_eq!(ticks(items), vec![lang], "expected only {lang:?} to be ticked");
     }
 
+    /// The language that is not `lang`.
+    fn the_other(lang: Lang) -> Lang {
+        Lang::ALL
+            .iter()
+            .copied()
+            .find(|l| *l != lang)
+            .expect("the language table holds more than one language")
+    }
+
+    /// Pins [`i18n::current`] for the duration of a test, and puts it back.
+    ///
+    /// `CURRENT` is a process-global `AtomicU8`, and the tests in this binary
+    /// run in parallel threads, so a test that only *reads* `current()` is
+    /// reading whatever another thread has momentarily set it to —
+    /// `i18n::tests::selecting_a_language_is_visible_through_t` walks it
+    /// through `En` and then `Zh`. That made these tests order-dependent: they
+    /// passed in the full suite (where the interleaving happened to suit them)
+    /// and failed when the module was run on its own. Pinning the value is what
+    /// makes them deterministic; restoring it is what keeps them from being the
+    /// cause of someone else's flake.
+    ///
+    /// A poisoned lock is deliberately *not* treated as a failure — a panic in
+    /// one test would otherwise cascade into every later one, hiding the real
+    /// error behind a wall of poison reports.
+    fn with_language<T>(lang: Lang, body: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = i18n::current();
+        i18n::set(lang);
+        let result = body();
+        i18n::set(before);
+        result
+    }
+
     #[test]
     fn the_language_menu_lists_every_language_once() {
         let (_menu, items) = build_language_menu("Language").expect("submenu");
@@ -561,10 +596,18 @@ mod tests {
         assert_eq!(texts, expected);
     }
 
+    /// Whichever language is in force when the menu is built is the ticked one.
+    ///
+    /// Run for *both* languages, so the assertion cannot be satisfied by a
+    /// menu that always ticks the same entry.
     #[test]
     fn the_initial_tick_is_on_the_language_in_force() {
-        let (_menu, items) = build_language_menu("Language").expect("submenu");
-        assert_only(&items, i18n::current());
+        for lang in Lang::ALL {
+            with_language(lang, || {
+                let (_menu, items) = build_language_menu("Language").expect("submenu");
+                assert_only(&items, lang);
+            });
+        }
     }
 
     /// Switching languages moves the tick instead of adding one.
@@ -573,23 +616,22 @@ mod tests {
     /// put it back — because the failure was never in one step alone.
     #[test]
     fn switching_language_moves_the_tick_rather_than_adding_one() {
-        let original = i18n::current();
-        let (_menu, items) = build_language_menu("Language").expect("submenu");
-        assert_only(&items, original);
+        let original = Lang::Zh;
+        let other = the_other(original);
 
-        let other = Lang::ALL
-            .iter()
-            .copied()
-            .find(|l| *l != original)
-            .expect("more than one language");
+        with_language(original, || {
+            let (_menu, items) = build_language_menu("Language").expect("submenu");
+            assert_only(&items, original);
 
-        i18n::set(other);
-        tick_languages(&items, i18n::current());
-        // The regression: before the fix this was [original, other].
-        assert_only(&items, other);
-        i18n::set(original);
-        tick_languages(&items, i18n::current());
-        assert_only(&items, original);
+            i18n::set(other);
+            tick_languages(&items, i18n::current());
+            // The regression: before the fix this was [original, other].
+            assert_only(&items, other);
+
+            i18n::set(original);
+            tick_languages(&items, i18n::current());
+            assert_only(&items, original);
+        });
     }
 
     /// Re-picking the language already in force must not clear its own tick.
@@ -600,32 +642,38 @@ mod tests {
     /// the tick even though English is still in force".
     #[test]
     fn re_picking_the_current_language_restores_its_tick() {
-        let current = i18n::current();
-        let (_menu, items) = build_language_menu("Language").expect("submenu");
-        let (_, item) = items
-            .iter()
-            .find(|(lang, _)| *lang == current)
-            .expect("the current language has an entry");
+        // Both languages get a turn: the bug cleared the tick of whichever was
+        // in force, so a test that only checked one would miss it on the other.
+        for current in Lang::ALL {
+            with_language(current, || {
+                let (_menu, items) = build_language_menu("Language").expect("submenu");
+                let (_, item) = items
+                    .iter()
+                    .find(|(lang, _)| *lang == current)
+                    .expect("the current language has an entry");
 
-        // What Windows leaves behind after the click toggled it off. The other
-        // entry is left ticked on purpose: the buggy implementation only *sets*
-        // the tick, which happens to be enough when nothing else is ticked, so
-        // a blank slate would let it pass. The real desktop state is "the wrong
-        // entry is ticked", and only a clearing implementation repairs that.
-        item.set_checked(false);
-        let (other_lang, other_item) = items
-            .iter()
-            .find(|(lang, _)| *lang != current)
-            .expect("more than one language");
-        other_item.set_checked(true);
-        assert_eq!(
-            ticks(&items),
-            vec![*other_lang],
-            "precondition: the other entry is ticked and the current one is not"
-        );
+                // What Windows leaves behind after the click toggled it off. The
+                // other entry is left ticked on purpose: the buggy
+                // implementation only *sets* the tick, which happens to be
+                // enough when nothing else is ticked, so a blank slate would let
+                // it pass. The real desktop state is "the wrong entry is ticked",
+                // and only a clearing implementation repairs that.
+                item.set_checked(false);
+                let (other_lang, other_item) = items
+                    .iter()
+                    .find(|(lang, _)| *lang != current)
+                    .expect("more than one language");
+                other_item.set_checked(true);
+                assert_eq!(
+                    ticks(&items),
+                    vec![*other_lang],
+                    "precondition: the other entry is ticked and the current one is not"
+                );
 
-        tick_languages(&items, i18n::current());
-        assert_only(&items, current);
+                tick_languages(&items, i18n::current());
+                assert_only(&items, current);
+            });
+        }
     }
 
     #[test]
