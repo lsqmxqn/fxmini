@@ -285,13 +285,23 @@ const EFFECTS: [EffectSlot; 5] = [
 
 /// Band counts the engine accepts.
 ///
-/// Five and ten only. The engine does take 15, 20 and 31 — `GraphicEqSetNumBands`
-/// validates 1..31 — but nothing upstream publishes frequencies for them: the
-/// band editors come up blank and dragging a node does nothing, because
-/// [`eq_curve`] draws no curve at all until the engine has published a
-/// frequency for every band. Offering a choice that leads to an empty plot is
-/// worse than not offering it, so the list stops at ten.
-const BAND_CHOICES: [usize; 2] = [5, 10];
+/// Every count here has a complete frequency grid in the engine:
+/// `GraphicEqSetNumBands` recomputes all centre frequencies on a change, with
+/// explicit ISO tables for 5, 10, 15, 20 and 31 bands, and the applier reads
+/// that grid back into [`SharedParams`] so [`eq_curve`] always has a frequency
+/// for every band.
+///
+/// This used to stop at ten, on the belief that nothing upstream published
+/// frequencies above ten so the plot came up blank. The blank plot was real,
+/// but the cause was the missing read-back, not the engine: the applier set the
+/// band count and never copied the resulting grid back out, so `band_freq`
+/// stayed zero and [`eq_curve`] bailed out. With that fixed the whole range is
+/// usable, so the list offers it.
+/// The full list is shared with the engine's tests, which assert that every
+/// count offered here really does publish a usable grid — the two have to stay
+/// in step, and a test that hard-coded its own list could not catch a choice
+/// added here that the engine cannot serve.
+pub(crate) const BAND_CHOICES: [usize; 5] = [5, 10, 15, 20, 31];
 
 /// Vertical padding inside a preset row, in points.
 ///

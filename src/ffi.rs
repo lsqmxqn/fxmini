@@ -112,6 +112,19 @@ extern "C" {
 }
 
 /// Safe-ish RAII handle around the C++ `DfxDsp` instance.
+///
+/// **At most one of these may be alive per process.** The vendored engine
+/// keeps its band count in a process-global, not in the handle:
+/// `DFXP_GRAPHIC_EQ_NUM_BANDS` (`DfxDspEq.cpp:32`) is written by
+/// `GraphicEqSetNumBands` (`GraphicEqSet.cpp:154`) and read by every `dfxpEq`
+/// entry point. Two engines therefore share that one integer, and a `sos`
+/// section resize started by one handle lands in the arrays the other is
+/// reading. The observed symptom is a hang, not a crash.
+///
+/// The app is built around this: exactly one engine is created, on the audio
+/// thread, and kept for the life of the process. The constraint is only easy to
+/// violate in tests, where each `#[test]` that builds its own `Dsp` looks
+/// harmless — see the `ENGINE_LOCK` note in `engine::tests`.
 pub struct Dsp {
     handle: DfxHandle,
 }

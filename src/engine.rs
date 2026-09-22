@@ -1337,6 +1337,17 @@ impl ParamApplier {
             self.applied_bands = bands;
             // Force a full gain refresh: the band count changed the grid.
             self.applied_gains = [None; MAX_BANDS];
+
+            // Publish the new grid. `set_num_bands` recomputes every centre
+            // frequency inside the engine, and the panel draws its curve from
+            // `band_freq`; without this read-back those slots keep whatever the
+            // previous grid left there (zero, on a fresh start), and the plot
+            // bails out as empty. `apply_preset` does the same thing for the
+            // same reason.
+            for band in 0..bands.min(MAX_BANDS) {
+                params.set_band_freq(band, dsp.band_freq(band as i32) as f32);
+                params.set_band_gain(band, dsp.band_gain(band as i32) as f32);
+            }
         }
 
         for effect in 0..ffi::DFX_EFFECT_COUNT {
@@ -2044,6 +2055,35 @@ fn join_audio_class() {
 mod tests {
     use super::*;
 
+    /// Serialises the tests that construct a [`Dsp`].
+    ///
+    /// The vendored engine keeps its band count in a **process-global**, not in
+    /// the handle: `DFXP_GRAPHIC_EQ_NUM_BANDS` (`DfxDspEq.cpp:32`) is written by
+    /// `GraphicEqSetNumBands` (`GraphicEqSet.cpp:154`) and read by every
+    /// `dfxpEq` entry point. Two engines in one process therefore share that
+    /// one integer, and a `sos` resize can land while another handle is reading
+    /// the arrays it governs. The symptom is a hang: the tests below run in
+    /// parallel by default and two of them wedged for over a minute apiece
+    /// before this lock existed, while each passed on its own.
+    ///
+    /// `ffi::Dsp` already documents that the engine must be driven from a single
+    /// thread. This is the stricter condition that it also cannot be
+    /// *instantiated* twice at once, which only ever bites in tests — the app
+    /// builds exactly one engine, on its audio thread.
+    ///
+    /// A poisoned lock is tolerated rather than propagated: the point is
+    /// mutual exclusion, and failing a second test because the first one
+    /// panicked would hide its own result.
+    static ENGINE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Runs `body` with no other engine-owning test in flight.
+    fn with_engine<T>(body: impl FnOnce() -> T) -> T {
+        let _guard = ENGINE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        body()
+    }
+
     #[test]
     fn resampler_preserves_duration() {
         let mut resampler = StreamResampler::new(48_000, 44_100, 2);
@@ -2141,58 +2181,159 @@ mod tests {
     /// Needs no audio hardware — `Dsp::new` only allocates — so it runs in CI.
     #[test]
     fn saving_a_preset_writes_a_file_our_parser_can_read_back() {
-        let dir = std::env::temp_dir().join(format!("fxmini-save-check-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        with_engine(|| {
+            let dir = std::env::temp_dir().join(format!("fxmini-save-check-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create the scratch directory");
 
-        let dsp = Dsp::new().expect("DfxDsp allocation failed");
-        // Upstream documents that the first call after construction can fail;
-        // `dspcheck` does the same two-call dance.
-        dsp.set_signal_format(32, 2, 48_000, 32);
-        dsp.set_signal_format(32, 2, 48_000, 32);
+            let dsp = Dsp::new().expect("DfxDsp allocation failed");
+            // Upstream documents that the first call after construction can
+            // fail; `dspcheck` does the same two-call dance.
+            dsp.set_signal_format(32, 2, 48_000, 32);
+            dsp.set_signal_format(32, 2, 48_000, 32);
 
-        // Something to save, so the file cannot be "correct" by being empty.
-        dsp.set_effect(ffi::DFX_EFFECT_BASS, 7.0);
+            // Something to save, so the file cannot be "correct" by being empty.
+            dsp.set_effect(ffi::DFX_EFFECT_BASS, 7.0);
 
-        // A space and a non-ASCII character on purpose: that is what the panel
-        // hands over, and the engine has to write it as UTF-8 in the name line.
-        let name = "Save check 测试";
-        assert!(
-            dsp.save_preset(name, &dir),
-            "save_preset refused a directory"
-        );
+            // A space and a non-ASCII character on purpose: that is what the
+            // panel hands over, and the engine has to write it as UTF-8 in the
+            // name line.
+            let name = "Save check 测试";
+            assert!(
+                dsp.save_preset(name, &dir),
+                "save_preset refused a directory"
+            );
 
-        let written = dir.join(format!("{name}.fac"));
-        assert!(
-            written.is_file(),
-            "save_preset(name, dir) should produce {:?} — if this fails, the \
-             argument meanings have changed and the panel is writing elsewhere",
-            written
-        );
+            let written = dir.join(format!("{name}.fac"));
+            assert!(
+                written.is_file(),
+                "save_preset(name, dir) should produce {:?} — if this fails, the \
+                 argument meanings have changed and the panel is writing elsewhere",
+                written
+            );
 
-        let parsed = crate::preset::FacPreset::from_file(&written).expect("our parser reads it");
-        assert_eq!(parsed.name, name, "the name line did not survive the round trip");
+            let parsed = crate::preset::FacPreset::from_file(&written).expect("our parser reads it");
+            assert_eq!(parsed.name, name, "the name line did not survive the round trip");
 
-        let bass = parsed
-            .effect_slider_value(ffi::DFX_EFFECT_BASS)
-            .expect("Bass has a Main slot");
-        assert!(
-            (bass - 7.0).abs() < 0.2,
-            "the save did not capture the live state: Bass came back as {bass}, expected 7.0"
-        );
+            let bass = parsed
+                .effect_slider_value(ffi::DFX_EFFECT_BASS)
+                .expect("Bass has a Main slot");
+            assert!(
+                (bass - 7.0).abs() < 0.2,
+                "the save did not capture the live state: Bass came back as {bass}, expected 7.0"
+            );
 
-        // And the trap itself: a *file* path lands one level too deep, so the
-        // wrapper must refuse it up front. It has to return `false` quickly —
-        // letting it reach the engine has been observed to hang, which is why
-        // the guard lives in `ffi::Dsp::save_preset` and is asserted here so a
-        // future change to either meaning is loud.
-        assert!(
-            !dsp.save_preset("nested", &dir.join("nested.fac")),
-            "passing a file path to save_preset should be refused"
-        );
-        // Nothing must have been created a level too deep.
-        assert!(!dir.join("nested.fac").exists());
+            // And the trap itself: a *file* path lands one level too deep, so
+            // the wrapper must refuse it up front. It has to return `false`
+            // quickly — letting it reach the engine has been observed to hang,
+            // which is why the guard lives in `ffi::Dsp::save_preset` and is
+            // asserted here so a future change to either meaning is loud.
+            assert!(
+                !dsp.save_preset("nested", &dir.join("nested.fac")),
+                "passing a file path to save_preset should be refused"
+            );
+            // Nothing must have been created a level too deep.
+            assert!(!dir.join("nested.fac").exists());
 
-        let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// Every band count the panel offers must come back with a full grid, on
+    /// the way up *and* on the way back down.
+    ///
+    /// The panel draws its curve from `band_freq` and bails out to an empty
+    /// plot the moment any band reports zero, so a grid that is only partially
+    /// published is indistinguishable from no grid at all. That was the actual
+    /// defect behind "15 and 31 bands come up blank": the band count took
+    /// effect inside the engine, but the applier never copied the recomputed
+    /// frequencies back into `SharedParams`, so the panel saw zeros.
+    ///
+    /// Drives the real [`ParamApplier`], not a copy of its body. An earlier
+    /// version of this test called `set_num_bands` and the read-back inline and
+    /// passed even with the fix removed, which made it worse than no test: it
+    /// implied the applier was covered when nothing was exercising it. Going
+    /// through `ParamApplier::apply` is the whole point — that call is what the
+    /// audio thread makes.
+    ///
+    /// The walk covers three things one `Dsp` cannot be split across:
+    ///
+    /// * a forward pass through every offered count,
+    /// * revisiting counts, which exercises the applier's "same as last time"
+    ///   early-out, and
+    /// * shrinking, which drives a different branch inside the vendored
+    ///   `GraphicEqSetNumBands` (it remaps the old gains onto the smaller
+    ///   layout, `GraphicEqSet.cpp:207-245`).
+    ///
+    /// One engine for all of it, deliberately. The vendored DSP is not
+    /// multi-instance safe — see [`ENGINE_LOCK`] — and splitting these into
+    /// three `#[test]`s that each built their own `Dsp` was measured to wedge
+    /// the third one. The app itself builds exactly one engine and keeps it for
+    /// the process's life, so one engine here is also the more faithful model.
+    #[test]
+    fn band_counts_round_trip_with_a_full_grid() {
+        with_engine(|| {
+            let dsp = Dsp::new().expect("DfxDsp allocation failed");
+            dsp.set_signal_format(32, 2, 48_000, 32);
+            dsp.set_signal_format(32, 2, 48_000, 32);
+
+            let params = SharedParams::default();
+            let mut applier = ParamApplier::new();
+
+            // The forward pass, then a backward pass, then a few revisits.
+            // 31 -> 20 is the case the panel's own list can produce by hand.
+            let walk: Vec<usize> = crate::ui::panel::BAND_CHOICES
+                .iter()
+                .copied()
+                .chain(crate::ui::panel::BAND_CHOICES.iter().rev().copied())
+                .chain([5, 10, 5, 31, 31, 15, 5])
+                .collect();
+
+            for (step, chosen) in walk.iter().copied().enumerate() {
+                params.set_num_bands(chosen);
+                applier.apply(&dsp, &params);
+
+                let bands = params.num_bands();
+                assert_eq!(
+                    bands, chosen,
+                    "step {step}: the applier clamped {chosen} away"
+                );
+
+                for band in 0..bands {
+                    let hz = params.band_freq(band);
+                    assert!(
+                        hz > 0.0,
+                        "step {step}, {chosen} bands: band {band} came back as \
+                         {hz} Hz, which makes the plot bail out as empty"
+                    );
+                }
+
+                // Ascending: the plot sorts nothing, and a crossed grid would
+                // draw a bow-tie. Cheap to check, and it is the invariant the
+                // curve drawing relies on.
+                let freqs: Vec<f32> = (0..bands).map(|band| params.band_freq(band)).collect();
+                assert!(
+                    freqs.windows(2).all(|pair| pair[0] < pair[1]),
+                    "step {step}, {chosen} bands are not ascending: {freqs:?}"
+                );
+
+                // The engine has to agree with what we published, or the read
+                // back above was measuring our own copy.
+                assert_eq!(
+                    dsp.num_bands() as usize,
+                    chosen,
+                    "step {step}: the applier never pushed {chosen} bands on"
+                );
+                for band in 0..bands {
+                    let our = params.band_freq(band);
+                    let theirs = dsp.band_freq(band as i32) as f32;
+                    assert!(
+                        (our - theirs).abs() < 0.5,
+                        "step {step}, band {band}: we hold {our} Hz but the \
+                         engine is at {theirs} Hz"
+                    );
+                }
+            }
+        });
     }
 }
