@@ -72,6 +72,13 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 
 /// `AUDCLNT_S_BUFFER_EMPTY` — returned by `GetBuffer` when the capture side has
 /// nothing left this iteration. Not an error.
+///
+/// This is the *normal* answer for a loopback capture client while the system
+/// is silent. WASAPI only pushes data to a render endpoint while a playback
+/// stream is active, and loopback capture taps that stream, so with nothing
+/// playing there is nothing to hand over — no packets, not even silent ones.
+/// Treating that as a fault is what made 欠载 climb during quiet stretches;
+/// see [`pump_render`].
 const AUDCLNT_S_BUFFER_EMPTY: i32 = 0x0889_0001u32 as i32;
 
 /// How long to wait on the audio events before doing a housekeeping pass
@@ -616,6 +623,10 @@ pub struct EngineStatus {
     /// Frames rendered since the graph was built.
     rendered_frames: AtomicU64,
     /// Moments where the renderer wanted data the capture side had not produced.
+    ///
+    /// Only counted while the capture stream is actually delivering: a silent
+    /// system supplies no loopback packets at all, and billing that to the
+    /// counter made a paused track look like a failing graph.
     underruns: AtomicU64,
     /// Captured frames discarded because the ring was full.
     overruns: AtomicU64,
@@ -1696,8 +1707,13 @@ fn run_graph(
             || signalled == WAIT_TIMEOUT;
 
         // 5. Drain the capture side into the ring.
+        //
+        // Zero frames here means the loopback tap is idle rather than broken:
+        // nothing is playing, so there is no stream for WASAPI to hand over.
+        // `pump_render` needs to know which of the two it is looking at.
+        let mut capture_active = false;
         if capture_ready {
-            if let Err(err) = pump_capture(
+            match pump_capture(
                 graph,
                 &mut ring,
                 &mut decoded,
@@ -1707,10 +1723,13 @@ fn run_graph(
                 params,
                 status,
             ) {
-                log::error!("capture failed: {err}");
-                status.set_error(err);
-                next_reason = Some(RebuildReason::Error);
-                break 'outer;
+                Ok(frames) => capture_active = frames > 0,
+                Err(err) => {
+                    log::error!("capture failed: {err}");
+                    status.set_error(err);
+                    next_reason = Some(RebuildReason::Error);
+                    break 'outer;
+                }
             }
         }
 
@@ -1723,6 +1742,7 @@ fn run_graph(
                 &mut encoded,
                 dsp,
                 bypass_dsp,
+                capture_active,
                 status,
             ) {
                 log::error!("render failed: {err}");
@@ -1804,6 +1824,13 @@ fn apply_preset(
 }
 
 /// Reads every available capture packet into the ring.
+///
+/// Returns the number of frames pushed. A count of zero does not mean the
+/// capture side failed: loopback capture goes quiet whenever nothing is
+/// playing, so an idle system legitimately delivers no packets. The caller
+/// uses that distinction to tell "nothing to play" apart from "starved", which
+/// is what [`pump_render`] needs in order not to log a gush of fake underruns
+/// across a silent stretch. See the note on `AUDCLNT_S_BUFFER_EMPTY` above.
 #[allow(clippy::too_many_arguments)]
 fn pump_capture(
     graph: &Graph,
@@ -1814,8 +1841,8 @@ fn pump_capture(
     mut resampler: Option<&mut StreamResampler>,
     _params: &SharedParams,
     status: &EngineStatus,
-) -> Result<(), String> {
-    let mut packets = 0usize;
+) -> Result<usize, String> {
+    let mut pushed = 0usize;
 
     loop {
         let mut data: *mut u8 = std::ptr::null_mut();
@@ -1863,8 +1890,6 @@ fn pump_capture(
         unsafe { graph.capture.ReleaseBuffer(frames) }
             .map_err(|err| format!("capture ReleaseBuffer failed: {err}"))?;
 
-        packets += 1;
-
         // Channel-map, then resample, then push.
         mapped.clear();
         map_channels(
@@ -1888,16 +1913,48 @@ fn pump_capture(
                 status.overruns.fetch_add(1, Ordering::Relaxed);
             }
             status.captured_frames.fetch_add(1, Ordering::Relaxed);
+            pushed += 1;
         }
     }
 
-    if packets == 0 {
-        log::trace!("capture produced nothing this cycle");
+    Ok(pushed)
+}
+
+/// Tallies `missing` unserved frames against the underrun counter.
+///
+/// Split out from [`pump_render`] so the rule can be tested directly: the
+/// renderer sits behind a live COM graph that unit tests cannot build, and the
+/// decision — not the buffer plumbing — is what the silent-playback bug was
+/// about. `missing` is `requested - popped`.
+///
+/// A shortfall is only an underrun when the capture side was actually feeding
+/// the ring this cycle (`capture_active`). Loopback capture produces no packets
+/// at all while the system is silent, so during a pause the ring is empty by
+/// definition and the renderer will always come up short; charging that to the
+/// counter turned every quiet moment into an apparently failing graph. When
+/// capture *is* running, a shortfall means the ring ran dry mid-stream, which
+/// is a real dropout and is counted.
+fn account_underrun(missing: usize, capture_active: bool, status: &EngineStatus) {
+    if missing > 0 && capture_active {
+        status
+            .underruns
+            .fetch_add(missing as u64, Ordering::Relaxed);
     }
-    Ok(())
 }
 
 /// Fills the render buffer from the ring, running the DSP over it in place.
+///
+/// `capture_active` is `true` when the capture side delivered at least one
+/// frame this cycle. It exists because WASAPI loopback capture stops producing
+/// packets entirely while nothing is playing — there is no stream to tap, so
+/// `GetBuffer` answers `AUDCLNT_S_BUFFER_EMPTY` and nothing ever reaches the
+/// ring — whereas the render endpoint is a real card with a running clock that
+/// keeps asking for frames regardless. [`account_underrun`] holds the rule that
+/// follows from that asymmetry, and the reasoning for it.
+// The argument count is inherent: every one of these is a distinct buffer or
+// endpoint the audio loop owns, passed down unchanged. The same allowance is on
+// `pump_capture`.
+#[allow(clippy::too_many_arguments)]
 fn pump_render(
     graph: &Graph,
     ring: &mut RingBuffer,
@@ -1905,6 +1962,7 @@ fn pump_render(
     encoded: &mut Vec<u8>,
     dsp: &Dsp,
     bypass_dsp: bool,
+    capture_active: bool,
     status: &EngineStatus,
 ) -> Result<(), String> {
     // SAFETY: live client.
@@ -1928,12 +1986,7 @@ fn pump_render(
     scratch.resize(frames * graph.dsp_channels, 0.0);
 
     let got = ring.pop_frames(frames, scratch);
-    if got < frames {
-        // Underrun: the tail stays whatever `resize` filled it with.
-        status
-            .underruns
-            .fetch_add((frames - got) as u64, Ordering::Relaxed);
-    }
+    account_underrun(frames - got, capture_active, status);
 
     if !bypass_dsp {
         dsp.process(scratch, frames as i32);
@@ -2120,6 +2173,53 @@ mod tests {
         let mut out = [0.0f32; 2];
         assert_eq!(ring.pop_frames(2, &mut out), 2);
         assert_eq!(out, [2.0, 3.0]);
+    }
+
+    /// Silence on the system must not be reported as a failing graph.
+    ///
+    /// This is the regression behind the 欠载 counter running away whenever
+    /// nothing was playing. Loopback capture hands over no packets at all while
+    /// the system is quiet, so the ring is empty and the renderer comes up
+    /// short on every single cycle — thousands of "missing" frames a second at
+    /// a normal buffer size. None of it is a dropout: there is simply nothing
+    /// to play.
+    #[test]
+    fn idle_capture_does_not_accrue_underruns() {
+        let status = EngineStatus::default();
+
+        // Ten render cycles over a silent system, each wanting a full block
+        // and getting none of it.
+        for _ in 0..10 {
+            account_underrun(128, false, &status);
+        }
+        assert_eq!(
+            status.underruns(),
+            0,
+            "an idle graph reported underruns; the counter is billing silence"
+        );
+    }
+
+    /// A ring that runs dry while capture is live is still a real dropout, and
+    /// the fix must not have papered over it.
+    #[test]
+    fn a_dry_ring_with_active_capture_is_still_an_underrun() {
+        let status = EngineStatus::default();
+
+        account_underrun(128, true, &status);
+        assert_eq!(
+            status.underruns(),
+            128,
+            "a starved renderer went unreported while capture was running"
+        );
+
+        // Partial shortfalls count only what was actually missing.
+        account_underrun(30, true, &status);
+        assert_eq!(status.underruns(), 158);
+
+        // A fully served block contributes nothing either way.
+        account_underrun(0, true, &status);
+        account_underrun(0, false, &status);
+        assert_eq!(status.underruns(), 158);
     }
 
     #[test]
